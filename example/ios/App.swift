@@ -68,44 +68,26 @@ final class GPUITextView: UIView {
 
 final class MarkdownContainerController: UIViewController {
     private var markdown: GPUITextView!
-    private var heightConstraint: NSLayoutConstraint!
     private var displayLink: CADisplayLink?
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "Markdown"
+        title = "GPUI Kit - TextView"
         overrideUserInterfaceStyle = .light
-        view.backgroundColor = .systemGroupedBackground
-
-        let sizeControl = UISegmentedControl(items: ["Compact", "Expanded"])
-        sizeControl.selectedSegmentIndex = 1
-        sizeControl.addTarget(self, action: #selector(resizeDocument(_:)), for: .valueChanged)
-
-        let header = UIStackView(arrangedSubviews: [sizeControl])
-        header.axis = .vertical
-        header.spacing = 12
-        header.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(header)
+        view.backgroundColor = .systemBackground
 
         markdown = GPUITextView(frame: .zero)
-        markdown.layer.cornerRadius = 16
         markdown.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(markdown)
         markdown.attach(to: self)
 
-        heightConstraint = markdown.heightAnchor.constraint(equalToConstant: 280)
         NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
-            header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            header.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
-            markdown.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 16),
-            markdown.leadingAnchor.constraint(equalTo: header.leadingAnchor),
-            markdown.trailingAnchor.constraint(equalTo: header.trailingAnchor),
-            markdown.bottomAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
+            markdown.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            markdown.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            markdown.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            markdown.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor),
         ])
-        let bottom = markdown.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16)
-        bottom.priority = .defaultHigh
-        bottom.isActive = true
+
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -122,11 +104,4 @@ final class MarkdownContainerController: UIViewController {
 
     @objc private func renderFrame() { markdown.drawFrame() }
 
-    @objc private func resizeDocument(_ sender: UISegmentedControl) {
-        UIView.performWithoutAnimation {
-            heightConstraint.isActive = sender.selectedSegmentIndex == 0
-            view.setNeedsLayout()
-            view.layoutIfNeeded()
-        }
-    }
 }

@@ -1,10 +1,13 @@
 # iOS Swift container example
 
-The iOS app uses a Swift `UINavigationController` and embeds GPUI Markdown
-inside a `GPUITextView: UIView`. UIKit owns the window, safe areas, and container
-size. GPUI renders only the document. The Compact / Expanded control exercises
-view resizing; the first screen combines emphasis, quotes, nested lists, code,
-and a table for screenshots.
+The Swift-owned UIKit window embeds a GPUI chat view. `Message`, `Bubble`,
+`TextView`, `Input`, and a shimmer-loading `Marker` compose a light conversation
+UI with a single-line composer, collapsible thought summaries, and copy actions.
+The sample history includes an offline GPUI Kit image, Chinese/English text,
+nested lists, code, tables, quotes, and links.
+
+Sending a message produces an explicitly labeled local demo response. No AI
+service is configured. UIKit moves the embedded view above the keyboard.
 
 The example pins GPUI Kit to a Git revision with mobile platform support.
 No sibling checkout or published mobile crate is required.

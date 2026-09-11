@@ -1,23 +1,26 @@
-## gpui-kit · Markdown
+## GPUI Kit - TextView
 
-**Bold**, *italic*, ***both***, ~~deleted~~, `inline code`, and a [link](https://gpui-kit.com). 🌿
+![Alpine lake beneath snow-capped mountains](https://gpui.example/alpine-lake.jpg)
 
-> **Note:** Rich text inside a quote, with *emphasis* and `code`.
+🚀 **你好，世界。** Build with *Rust* and `gpui-kit`.
 
-- **Nested list**
-  - Mix *styles* and `values`.
-  - Wrap naturally on a small screen.
+**Bold**、*斜体*、~~删除线~~、`行内代码`与[文档](https://gpui-kit.com)。
+
+> **原生体验，跨越平台。** Rendered by GPUI.
+
+- **自由组合 · Compose naturally**
+  - 图文混排与 *nested content*。
 
 ```rust
-let view = TextView::markdown("demo", text)
-    .selectable(true);
+TextView::markdown("hello", "# gpui-kit")
+    .selectable(true)
 ```
 
 | Feature | Example | State |
 | :--- | :---: | ---: |
-| **Text** | *Styled* | Ready |
+| **文字** | *中英混排* | Ready |
 | `Code` | `42` | Done |
-| Link | [Docs](https://gpui-kit.com) | Open |
+| 图片 | 山间湖泊 | Loaded |
 
 ---
 

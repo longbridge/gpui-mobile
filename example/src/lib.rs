@@ -200,8 +200,9 @@ pub extern "C" fn gpui_ios_register_app() {
     gpui_mobile::ios::ffi::set_app_callback(Box::new(|cx: &mut App| {
         gpui_kit::init(cx);
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Light, None, cx);
+        screens::markdown::init(cx);
         cx.open_window(WindowOptions::default(), |window, cx| {
-            let content = cx.new(|_| EmbeddedMarkdown);
+            let content = cx.new(|cx| screens::ai_chat::AiChat::new(window, cx));
             cx.new(|cx| gpui_kit::component::Root::new(content, window, cx))
         })
         .expect("open embedded Markdown view");
@@ -244,6 +245,7 @@ fn open_main_window(cx: &mut App) {
     let http_client: reqwest_client::ReqwestClient = client.into();
     cx.set_http_client(std::sync::Arc::new(http_client));
     log::info!("HTTP client configured successfully");
+    screens::markdown::init(cx);
 
     // Check if the app was launched via a deeplink and determine the initial screen.
     let initial_screen = match gpui_mobile::packages::deeplink::get_initial_link() {
@@ -292,26 +294,4 @@ fn open_main_window(cx: &mut App) {
     }
 
     cx.activate(true);
-}
-
-#[cfg(target_os = "ios")]
-struct EmbeddedMarkdown;
-
-#[cfg(target_os = "ios")]
-impl gpui::Render for EmbeddedMarkdown {
-    fn render(
-        &mut self,
-        _: &mut gpui::Window,
-        cx: &mut gpui::Context<Self>,
-    ) -> impl gpui::IntoElement {
-        use gpui::prelude::*;
-        gpui::div().size_full().flex().flex_col().child(
-            gpui::div()
-                .id("embedded-markdown-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .child(screens::markdown::render(cx)),
-        )
-    }
 }

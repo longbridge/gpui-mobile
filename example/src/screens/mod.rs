@@ -12,6 +12,8 @@
 //! - **Animations** — bouncing balls with physics, trails, and particle effects.
 //! - **Shaders** — dynamic gradients, floating orbs, and ripple effects.
 
+#[cfg(target_os = "ios")]
+pub mod ai_chat;
 pub mod about;
 pub mod audio_player;
 pub mod chat;
