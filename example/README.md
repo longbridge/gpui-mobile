@@ -1,3 +1,31 @@
+# iOS Swift container example
+
+The iOS app uses a Swift `UINavigationController` and embeds GPUI Markdown
+inside a `GPUITextView: UIView`. UIKit owns the window, safe areas, and container
+size. GPUI renders only the document. The Compact / Expanded control exercises
+view resizing; the first screen combines emphasis, quotes, nested lists, code,
+and a table for screenshots.
+
+The example pins GPUI Kit to a Git revision with mobile platform support.
+No sibling checkout or published mobile crate is required.
+
+```sh
+./build.sh ios --simulator
+```
+
+Requires Xcode, an available iOS runtime, XcodeGen, and the
+`aarch64-apple-ios-sim` Rust target. Use `--no-run` to build only.
+
+`App.swift` owns the native container and display link. `Embedding.h` exposes
+the Rust bridge. The child GPUI controller uses UIKit containment, and layout
+changes propagate to the Metal surface and GPUI viewport.
+
+This example hosts one GPUI view for the application's lifetime. It does not
+yet provide an independently destroyable, multi-instance embedding API.
+
+
+---
+
 # Android Example App — GPUI Mobile
 
 A multi-screen GPUI application with navigation, interactive touch input, and
