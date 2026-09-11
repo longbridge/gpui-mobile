@@ -2,7 +2,7 @@
 
 Mobile platform layer for [GPUI](https://github.com/zed-industries/zed) — run Rust UI apps natively on **iOS** and **Android**.
 
-[![Build & Test](https://github.com/itsbalamurali/gpui-mobile/actions/workflows/ci.yml/badge.svg)](https://github.com/itsbalamurali/gpui-mobile/actions/workflows/ci.yml)
+[![Build & Test](https://github.com/longbridge/gpui-mobile/actions/workflows/ci.yml/badge.svg)](https://github.com/longbridge/gpui-mobile/actions/workflows/ci.yml)
 
 ## Overview
 
@@ -14,6 +14,26 @@ Implements the `gpui::Platform` trait for mobile targets, following the same arc
 | **Android** | Vulkan/GL via wgpu | cosmic-text + swash |
 
 **Highlights:** GPU-accelerated rendering, touch input with momentum scrolling, keyboard support, safe area insets, dark mode, and emoji rendering.
+
+## GPUI pre-release dependencies
+
+This fork publishes as `gpui-pre-mobile` and uses the crates.io GPUI snapshots
+from GPUI Kit. Version `0.1.0` targets `gpui-pre` and `gpui-pre-wgpu` **0.3.4**.
+Both are pinned together so the platform, renderer, and application share the
+same GPUI types. No Zed Git checkout or consumer Cargo patches are needed.
+
+```toml
+[dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.4", default-features = false }
+gpui-mobile = { package = "gpui-pre-mobile", version = "0.1.0" }
+```
+
+The Rust library name remains `gpui_mobile`, including its native library
+filenames. Existing `use gpui_mobile::...` imports continue to work. Native app
+entry points and build steps are demonstrated in `example/`.
+
+This is an experimental platform release. Switching to `gpui-pre` does not
+complete mobile IME composition, accessibility, or the mobile lifecycle hooks.
 
 ## Quick Start
 
