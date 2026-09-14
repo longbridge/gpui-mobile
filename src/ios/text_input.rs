@@ -6,6 +6,32 @@
 
 use gpui::{KeyDownEvent, Keystroke, Modifiers, PlatformInput};
 
+/// Configure the public UITextInputTraits properties on the native text view.
+///
+/// UIKit can implement these selectors through Objective-C forwarding rather
+/// than entries in UITextView's method table. objc2's debug msg_send! verifier
+/// rejects those valid messages before the runtime can forward them. Restrict
+/// direct dispatch to these three known setters with their exact ABI:
+/// void (id, SEL, NSInteger).
+///
+/// # Safety
+/// `view` must be a live UITextView, accessed on the UIKit main thread.
+pub(super) unsafe fn configure_keyboard_traits(
+    view: *mut objc2::runtime::AnyObject,
+    keyboard_type: isize,
+) {
+    let send: unsafe extern "C-unwind" fn(
+        *mut objc2::runtime::AnyObject,
+        objc2::runtime::Sel,
+        isize,
+    ) = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
+    unsafe {
+        send(view, objc2::sel!(setKeyboardType:), keyboard_type);
+        send(view, objc2::sel!(setAutocorrectionType:), 1);
+        send(view, objc2::sel!(setAutocapitalizationType:), 0);
+    }
+}
+
 /// NSRange uses UTF-16 code units, matching GPUI's platform input handler.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

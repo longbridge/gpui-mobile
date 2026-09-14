@@ -339,7 +339,7 @@ fn register_text_input_view_class() -> &'static AnyClass {
                 let bytes = text_string.as_bytes();
                 let committed: *mut AnyObject = msg_send![class!(NSString), alloc];
                 let committed: *mut AnyObject = msg_send![committed,
-                    initWithBytes: bytes.as_ptr(), length: bytes.len(), encoding: 4_usize];
+                    initWithBytes: bytes.as_ptr().cast::<c_void>(), length: bytes.len(), encoding: 4_usize];
                 window.handle_text_input(committed);
                 let _: () = msg_send![committed, release];
             }
@@ -925,11 +925,7 @@ impl IosWindow {
                 log::error!("GPUI iOS: text_input_view is NULL!");
                 return;
             }
-            let _: () = msg_send![self.text_input_view, setKeyboardType: kb_type];
-            log::info!("GPUI iOS: setAutocorrectionType");
-            let _: () = msg_send![self.text_input_view, setAutocorrectionType: 1_isize];
-            log::info!("GPUI iOS: setAutocapitalizationType");
-            let _: () = msg_send![self.text_input_view, setAutocapitalizationType: 0_isize];
+            super::text_input::configure_keyboard_traits(self.text_input_view, kb_type);
             log::info!("GPUI iOS: scheduling becomeFirstResponder");
 
             // Defer becomeFirstResponder to the next run-loop iteration.
