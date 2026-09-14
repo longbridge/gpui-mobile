@@ -1,13 +1,28 @@
 //! iOS text input handling.
 //!
 //! This module provides keyboard input support for iOS.
-//! For now, we use a simple approach that handles software keyboard input
-//! through the window's text input view.
-//!
-//! Full UITextInput protocol support (for IME, marked text, etc.) can be
-//! added later if needed.
+//! The window uses a native UITextView as its composition buffer so UIKit
+//! supplies the full UITextInput protocol, including multistage Chinese IME.
 
 use gpui::{KeyDownEvent, Keystroke, Modifiers, PlatformInput};
+
+/// NSRange uses UTF-16 code units, matching GPUI's platform input handler.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ObjcNSRange {
+    pub location: usize,
+    pub length: usize,
+}
+
+unsafe impl objc2::encode::Encode for ObjcNSRange {
+    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Struct(
+        "_NSRange",
+        &[
+            <usize as objc2::encode::Encode>::ENCODING,
+            <usize as objc2::encode::Encode>::ENCODING,
+        ],
+    );
+}
 
 /// Convert a key code from UIKeyboardHIDUsage to a GPUI key string.
 ///
