@@ -374,6 +374,20 @@ fn register_text_input_view_class() -> &'static AnyClass {
             end_edit(this);
         }
 
+        // UIKit's attributed composition entry point does not call the plain
+        // setMarkedText override. Modern IMEs can update exclusively through it.
+        unsafe extern "C" fn set_attributed_marked_text(
+            this: *mut AnyObject,
+            _sel: Sel,
+            text: *mut AnyObject,
+            selected: super::text_input::ObjcNSRange,
+        ) {
+            begin_edit(this);
+            let _: () = msg_send![super(this, class!(UITextView)),
+                setAttributedMarkedText: text, selectedRange: selected];
+            end_edit(this);
+        }
+
         #[allow(deprecated)]
         unsafe extern "C" fn reset_composition(this: *mut AnyObject, _sel: Sel) {
             // Focus may already belong to another GPUI input by the time the
@@ -439,6 +453,16 @@ fn register_text_input_view_class() -> &'static AnyClass {
             decl.add_method(
                 sel!(unmarkText),
                 unmark_text as unsafe extern "C" fn(*mut AnyObject, Sel),
+            );
+            decl.add_method(
+                sel!(setAttributedMarkedText:selectedRange:),
+                set_attributed_marked_text
+                    as unsafe extern "C" fn(
+                        *mut AnyObject,
+                        Sel,
+                        *mut AnyObject,
+                        super::text_input::ObjcNSRange,
+                    ),
             );
             decl.add_method(
                 sel!(gpuiResetComposition),
