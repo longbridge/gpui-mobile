@@ -507,6 +507,59 @@ fn handle_touches(view: *mut AnyObject, touches: *mut AnyObject, event: *mut Any
     }
 }
 
+/// A host callback that resumes the display link, with its context pointer.
+pub(crate) type HostFrameWaker = (unsafe extern "C" fn(*mut c_void), *mut c_void);
+
+/// Frame demand, shared between GPUI's window invalidator (through
+/// [`PlatformWindow::frame_waker`] and [`PlatformWindow::schedule_frame`]) and
+/// the host's display link (through [`super::ffi::gpui_ios_request_frame`]).
+///
+/// GPUI asks for a frame when a view is notified, when an animation wants the
+/// next frame, or when a frame it just drew left the window dirty. Without
+/// this, a host has to tick GPUI on every vsync and GPUI decides each time
+/// whether there is anything to draw; with it, the host can pause its
+/// `CADisplayLink` after a tick that produced no demand and resume it from
+/// the waker, so an idle screen costs no CPU at all.
+#[derive(Default)]
+pub(crate) struct FrameDemand {
+    /// A frame has been asked for since the host last ticked.
+    pending: Cell<bool>,
+    host_waker: Cell<Option<HostFrameWaker>>,
+}
+
+impl FrameDemand {
+    /// Records demand and, on the first demand since the last tick, resumes
+    /// the host's frame source. Main thread only, like everything in GPUI.
+    pub(crate) fn wake(&self) {
+        if self.pending.replace(true) {
+            return;
+        }
+        if let Some((waker, context)) = self.host_waker.get() {
+            // Safety: the host registered this pair and guarantees it stays
+            // valid until it clears the waker.
+            unsafe { waker(context) };
+        }
+    }
+
+    /// Clears the demand at the start of a tick; a frame drawn in this tick
+    /// re-raises it if it wants another.
+    pub(crate) fn take(&self) -> bool {
+        self.pending.replace(false)
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending.get()
+    }
+
+    pub(crate) fn set_host_waker(&self, waker: Option<HostFrameWaker>) {
+        self.host_waker.set(waker);
+        // Demand that arrived before the host registered must not be lost.
+        if let (true, Some((waker, context))) = (self.pending.get(), waker) {
+            unsafe { waker(context) };
+        }
+    }
+}
+
 /// iOS Window backed by UIWindow + UIViewController.
 
 #[allow(clippy::type_complexity)]
@@ -528,6 +581,8 @@ pub(crate) struct IosWindow {
     /// Callback for frame requests
     /// Note: pub(super) to allow ffi.rs to access this for the display link callback
     pub(super) request_frame_callback: RefCell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
+    /// Whether GPUI wants a frame; see [`FrameDemand`].
+    pub(super) frame_demand: Rc<FrameDemand>,
     /// Callback for input events
     input_callback: RefCell<Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>>,
     /// Callback for active status changes
@@ -647,6 +702,7 @@ impl IosWindow {
                 scale_factor: Cell::new(scale_factor),
                 input_handler: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
+                frame_demand: Rc::new(FrameDemand::default()),
                 input_callback: RefCell::new(None),
                 active_status_callback: RefCell::new(None),
                 visibility_callback: RefCell::new(None),
@@ -1410,6 +1466,21 @@ impl PlatformWindow for IosWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         *self.request_frame_callback.borrow_mut() = Some(callback);
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // Weak: GPUI stores the waker in the window's invalidator for the
+        // window's lifetime, and this window is boxed inside that window.
+        let demand = Rc::downgrade(&self.frame_demand);
+        Some(Rc::new(move || {
+            if let Some(demand) = demand.upgrade() {
+                demand.wake();
+            }
+        }))
+    }
+
+    fn schedule_frame(&self) {
+        self.frame_demand.wake();
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {

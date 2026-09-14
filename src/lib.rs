@@ -152,6 +152,15 @@ type TextInputCallbackFn = Box<dyn FnMut(&str)>;
 /// which in turn calls `drain_pending_text()` and updates the UI.
 pub static TEXT_INPUT_DIRTY: AtomicBool = AtomicBool::new(false);
 
+/// Marks text input as waiting and asks the platform for the frame that will
+/// process it — a host that paused its frame source on an idle screen has
+/// to be woken, since typing does not go through GPUI's invalidator.
+fn mark_text_input_dirty() {
+    TEXT_INPUT_DIRTY.store(true, Ordering::Release);
+    #[cfg(target_os = "ios")]
+    ios::ffi::wake_windows();
+}
+
 thread_local! {
     /// Global text input callback — set by the active text input component.
     /// When the software keyboard sends text, this callback is invoked.
@@ -177,7 +186,7 @@ pub fn dispatch_text_input(text: &str) -> bool {
     TEXT_INPUT_CALLBACK.with(|cb| {
         if let Some(callback) = cb.borrow_mut().as_mut() {
             callback(text);
-            TEXT_INPUT_DIRTY.store(true, Ordering::Release);
+            mark_text_input_dirty();
             true
         } else {
             false
@@ -291,7 +300,7 @@ pub fn set_keyboard_height(height: f32) {
     let prev = f32::from_bits(KEYBOARD_HEIGHT_BITS.load(Ordering::Relaxed));
     if (prev - height).abs() > 0.5 {
         KEYBOARD_HEIGHT_BITS.store(height.to_bits(), Ordering::Release);
-        TEXT_INPUT_DIRTY.store(true, Ordering::Release);
+        mark_text_input_dirty();
     }
 }
 
