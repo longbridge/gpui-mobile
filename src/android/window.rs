@@ -279,10 +279,11 @@ struct WindowState {
     /// new surface *before* dropping the old one. The framework sometimes hands a
     /// recreated `SurfaceView` back the very same `ANativeWindow`, and building a second
     /// surface for it aborts inside wgpu-hal with `ERROR_NATIVE_WINDOW_IN_USE_KHR`.
-    /// Comparing against this address makes that case detectable. It is only cleared
-    /// when the renderer goes away, never in `term_window` — the surface keeps the
-    /// native window alive, so a matching address always means the *same live* object
-    /// rather than a recycled allocation.
+    /// Comparing against this address lets `init_window` release the old surface before
+    /// creating the new one. The field is never cleared in `term_window` —
+    /// `unconfigure_surface` keeps the wgpu surface (and therefore the native window)
+    /// alive, so a matching address always means the *same live* object rather than a
+    /// recycled allocation.
     surface_window_addr: usize,
 
     // ── callbacks ─────────────────────────────────────────────────────────
@@ -457,20 +458,36 @@ impl AndroidWindow {
         // AtlasTextureIds so GPUI's scene cache remains valid.
         let incoming_addr = native_window.ptr().as_ptr() as usize;
         if state.renderer.is_some() && state.surface_window_addr == incoming_addr {
-            // Same live `ANativeWindow` as the surface we already hold — reconfigure it
-            // instead of asking Vulkan for a second surface on the same window.
+            // Same live `ANativeWindow` as the surface we already hold. Two things
+            // rule out the paths used elsewhere in this function:
+            //
+            // - `replace_surface` creates the new surface *before* dropping the old
+            //   one, and Vulkan refuses a second surface on a window that is still
+            //   connected (`ERROR_NATIVE_WINDOW_IN_USE_KHR`, an `expect` inside
+            //   wgpu-hal that cannot be caught).
+            // - `update_drawable_size` alone is not enough: `term_window` left the
+            //   surface unconfigured, and nothing but a surface rebuild re-arms it,
+            //   so `draw` would keep bailing out and the window would stay black.
+            //
+            // `destroy` releases the old surface first; `recover` then rebuilds the
+            // renderer on the same window while keeping the atlas `Arc` that GPUI
+            // holds (its tiles are cleared and re-rasterised on the next paint, which
+            // `force_render_once` below guarantees).
             log::info!(
-                "AndroidWindow::init_window — same native window, reusing surface {}×{}",
+                "AndroidWindow::init_window — same native window, rebuilding surface {}×{}",
                 width,
                 height
             );
-            if let Some(mut renderer) = state.renderer.take() {
-                renderer.update_drawable_size(gpui::size(
-                    gpui::DevicePixels(width),
-                    gpui::DevicePixels(height),
-                ));
-                state.renderer = Some(renderer);
-            }
+            let raw = Self::raw_window(&native_window);
+            let renderer = state.renderer.as_mut().unwrap();
+            renderer.destroy();
+            renderer
+                .recover(&raw)
+                .context("failed to rebuild the wgpu surface on the same native window")?;
+            renderer.update_drawable_size(gpui::size(
+                gpui::DevicePixels(width),
+                gpui::DevicePixels(height),
+            ));
         } else if state.renderer.is_some() {
             let raw = Self::raw_window(&native_window);
             let config = WgpuSurfaceConfig {

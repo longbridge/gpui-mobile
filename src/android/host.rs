@@ -129,12 +129,12 @@ fn render_thread<F: FnOnce()>(launch: F) {
     let mut launched = Some(launch);
 
     loop {
-        for command in COMMANDS
-            .lock()
-            .expect("poisoned")
-            .drain(..)
-            .collect::<Vec<_>>()
-        {
+        // Drain into a local first: a `for` over `COMMANDS.lock()…` would keep the
+        // guard alive for the whole loop body (temporaries in the iterator expression
+        // live until the loop ends), blocking every `post()` from the Java UI thread
+        // while surfaces are rebuilt or the UI is first constructed.
+        let commands: Vec<Command> = COMMANDS.lock().expect("poisoned").drain(..).collect();
+        for command in commands {
             match command {
                 Command::SurfaceCreated { window, scale } => {
                     on_surface_created(&platform, window, scale, &mut launched);
