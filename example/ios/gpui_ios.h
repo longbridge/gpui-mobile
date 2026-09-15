@@ -78,7 +78,8 @@ void gpui_ios_handle_touch(void* window_ptr, void* touch_ptr, void* event_ptr);
 /// changed; the return value says whether more frames are wanted. A host that
 /// registered a waker with gpui_ios_set_frame_waker() can pause its display
 /// link on false and resume it from the waker; a host that ticks every vsync
-/// may ignore the return value.
+/// may ignore the return value. A NULL window_ptr returns false: there is no
+/// window to draw, so a pausing host stays paused until it registers a real one.
 /// The window_ptr should be the value returned by gpui_ios_get_window().
 bool gpui_ios_request_frame(void* window_ptr);
 

@@ -12,6 +12,7 @@
 
 use super::events::*;
 use super::IosDisplay;
+use crate::frame_demand::FrameDemand;
 
 use gpui::{
     point, px, size, AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile,
@@ -503,59 +504,6 @@ fn handle_touches(view: *mut AnyObject, touches: *mut AnyObject, event: *mut Any
         for i in 0..count {
             let touch: *mut AnyObject = msg_send![all_touches, objectAtIndex: i];
             window.handle_touch(touch, event);
-        }
-    }
-}
-
-/// A host callback that resumes the display link, with its context pointer.
-pub(crate) type HostFrameWaker = (unsafe extern "C" fn(*mut c_void), *mut c_void);
-
-/// Frame demand, shared between GPUI's window invalidator (through
-/// [`PlatformWindow::frame_waker`] and [`PlatformWindow::schedule_frame`]) and
-/// the host's display link (through [`super::ffi::gpui_ios_request_frame`]).
-///
-/// GPUI asks for a frame when a view is notified, when an animation wants the
-/// next frame, or when a frame it just drew left the window dirty. Without
-/// this, a host has to tick GPUI on every vsync and GPUI decides each time
-/// whether there is anything to draw; with it, the host can pause its
-/// `CADisplayLink` after a tick that produced no demand and resume it from
-/// the waker, so an idle screen costs no CPU at all.
-#[derive(Default)]
-pub(crate) struct FrameDemand {
-    /// A frame has been asked for since the host last ticked.
-    pending: Cell<bool>,
-    host_waker: Cell<Option<HostFrameWaker>>,
-}
-
-impl FrameDemand {
-    /// Records demand and, on the first demand since the last tick, resumes
-    /// the host's frame source. Main thread only, like everything in GPUI.
-    pub(crate) fn wake(&self) {
-        if self.pending.replace(true) {
-            return;
-        }
-        if let Some((waker, context)) = self.host_waker.get() {
-            // Safety: the host registered this pair and guarantees it stays
-            // valid until it clears the waker.
-            unsafe { waker(context) };
-        }
-    }
-
-    /// Clears the demand at the start of a tick; a frame drawn in this tick
-    /// re-raises it if it wants another.
-    pub(crate) fn take(&self) -> bool {
-        self.pending.replace(false)
-    }
-
-    pub(crate) fn is_pending(&self) -> bool {
-        self.pending.get()
-    }
-
-    pub(crate) fn set_host_waker(&self, waker: Option<HostFrameWaker>) {
-        self.host_waker.set(waker);
-        // Demand that arrived before the host registered must not be lost.
-        if let (true, Some((waker, context))) = (self.pending.get(), waker) {
-            unsafe { waker(context) };
         }
     }
 }
