@@ -13,7 +13,7 @@
 //! gpui_ios_request_frame(ptr)  // called every CADisplayLink tick; returns whether GPUI wants another
 //! ```
 
-use gpui::{App, AppContext, Application, RequestFrameOptions, WindowOptions};
+use gpui::{App, AppContext, Application, RequestFrameOptions, WindowOptions, WindowVisibility};
 use std::ffi::c_void;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -160,13 +160,14 @@ pub extern "C" fn gpui_ios_did_finish_launching(_app_ptr: *mut c_void) {
 pub extern "C" fn gpui_ios_will_enter_foreground(_app_ptr: *mut c_void) {
     log::info!("GPUI iOS: Will enter foreground");
 
-    // Notify all windows that they're becoming active
+    // Notify all windows that they're back on screen and becoming active
     if let Some(wrapper) = IOS_WINDOW_LIST.get() {
         unsafe {
             let windows = &*wrapper.0.get();
             for &window_ptr in windows.iter() {
                 if !window_ptr.is_null() {
                     let window = &*window_ptr;
+                    window.notify_visibility_change(WindowVisibility::Visible);
                     window.notify_active_status_change(true);
                 }
             }
@@ -235,6 +236,7 @@ pub extern "C" fn gpui_ios_did_enter_background(_app_ptr: *mut c_void) {
                 if !window_ptr.is_null() {
                     let window = &*window_ptr;
                     window.notify_active_status_change(false);
+                    window.notify_visibility_change(WindowVisibility::Hidden);
                 }
             }
         }
@@ -285,7 +287,8 @@ pub extern "C" fn gpui_ios_handle_touch(
 /// input is waiting). A host that registered a waker with
 /// [`gpui_ios_set_frame_waker`] can pause its display link on `false` and
 /// resume it from the waker; a host that ticks unconditionally may ignore
-/// the return value.
+/// the return value. A null `window_ptr` returns `false`: there is no window
+/// to draw, so a pausing host stays paused until it registers a real one.
 ///
 /// The window_ptr should be the value returned by gpui_ios_get_window().
 #[unsafe(no_mangle)]
@@ -304,7 +307,7 @@ pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) -> bool {
     // Demand raised during the frame (a view notified mid-draw, an animation
     // asking for its next frame) must survive into the return value, so the
     // slate is cleared before the frame, not after.
-    window.frame_demand.take();
+    window.frame_demand.clear();
 
     // Take the callback, invoke it, then restore it
     // We must complete the borrow before invoking the callback,
@@ -339,6 +342,7 @@ pub extern "C" fn gpui_ios_set_frame_waker(
     if window_ptr.is_null() {
         return;
     }
+    // Safety: window_ptr must be a valid pointer to an IosWindow
     let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
     window
         .frame_demand

@@ -72,6 +72,8 @@ pub use gpui;
 // ── shared modules ───────────────────────────────────────────────────────────
 
 pub mod components;
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+pub(crate) mod frame_demand;
 pub mod momentum;
 pub mod packages;
 pub mod platform_view;
@@ -155,7 +157,7 @@ pub static TEXT_INPUT_DIRTY: AtomicBool = AtomicBool::new(false);
 /// Marks text input as waiting and asks the platform for the frame that will
 /// process it — a host that paused its frame source on an idle screen has
 /// to be woken, since typing does not go through GPUI's invalidator.
-fn mark_text_input_dirty() {
+pub(crate) fn mark_text_input_dirty() {
     TEXT_INPUT_DIRTY.store(true, Ordering::Release);
     #[cfg(target_os = "ios")]
     ios::ffi::wake_windows();

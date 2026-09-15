@@ -13,6 +13,7 @@
 use super::events::*;
 use super::IosDisplay;
 
+use crate::frame_demand::FrameDemand;
 use gpui::{
     point, px, size, AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile,
     Bounds, Capslock, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
@@ -507,59 +508,6 @@ fn handle_touches(view: *mut AnyObject, touches: *mut AnyObject, event: *mut Any
     }
 }
 
-/// A host callback that resumes the display link, with its context pointer.
-pub(crate) type HostFrameWaker = (unsafe extern "C" fn(*mut c_void), *mut c_void);
-
-/// Frame demand, shared between GPUI's window invalidator (through
-/// [`PlatformWindow::frame_waker`] and [`PlatformWindow::schedule_frame`]) and
-/// the host's display link (through [`super::ffi::gpui_ios_request_frame`]).
-///
-/// GPUI asks for a frame when a view is notified, when an animation wants the
-/// next frame, or when a frame it just drew left the window dirty. Without
-/// this, a host has to tick GPUI on every vsync and GPUI decides each time
-/// whether there is anything to draw; with it, the host can pause its
-/// `CADisplayLink` after a tick that produced no demand and resume it from
-/// the waker, so an idle screen costs no CPU at all.
-#[derive(Default)]
-pub(crate) struct FrameDemand {
-    /// A frame has been asked for since the host last ticked.
-    pending: Cell<bool>,
-    host_waker: Cell<Option<HostFrameWaker>>,
-}
-
-impl FrameDemand {
-    /// Records demand and, on the first demand since the last tick, resumes
-    /// the host's frame source. Main thread only, like everything in GPUI.
-    pub(crate) fn wake(&self) {
-        if self.pending.replace(true) {
-            return;
-        }
-        if let Some((waker, context)) = self.host_waker.get() {
-            // Safety: the host registered this pair and guarantees it stays
-            // valid until it clears the waker.
-            unsafe { waker(context) };
-        }
-    }
-
-    /// Clears the demand at the start of a tick; a frame drawn in this tick
-    /// re-raises it if it wants another.
-    pub(crate) fn take(&self) -> bool {
-        self.pending.replace(false)
-    }
-
-    pub(crate) fn is_pending(&self) -> bool {
-        self.pending.get()
-    }
-
-    pub(crate) fn set_host_waker(&self, waker: Option<HostFrameWaker>) {
-        self.host_waker.set(waker);
-        // Demand that arrived before the host registered must not be lost.
-        if let (true, Some((waker, context))) = (self.pending.get(), waker) {
-            unsafe { waker(context) };
-        }
-    }
-}
-
 /// iOS Window backed by UIWindow + UIViewController.
 
 #[allow(clippy::type_complexity)]
@@ -587,6 +535,9 @@ pub(crate) struct IosWindow {
     input_callback: RefCell<Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>>,
     /// Callback for active status changes
     active_status_callback: RefCell<Option<Box<dyn FnMut(bool)>>>,
+    /// Whether the window is on screen; see [`Self::notify_visibility_change`].
+    visibility: Cell<WindowVisibility>,
+    /// Callback for visibility changes; only transitions are reported.
     visibility_callback: RefCell<Option<Box<dyn FnMut(WindowVisibility)>>>,
     /// Callback for hover status changes (not really applicable on iOS)
     hover_status_callback: RefCell<Option<Box<dyn FnMut(bool)>>>,
@@ -705,6 +656,8 @@ impl IosWindow {
                 frame_demand: Rc::new(FrameDemand::default()),
                 input_callback: RefCell::new(None),
                 active_status_callback: RefCell::new(None),
+                // Windows are created while the app is in the foreground.
+                visibility: Cell::new(WindowVisibility::Visible),
                 visibility_callback: RefCell::new(None),
                 hover_status_callback: RefCell::new(None),
                 resize_callback: RefCell::new(None),
@@ -1179,12 +1132,22 @@ impl IosWindow {
         if let Some(callback) = self.active_status_callback.borrow_mut().as_mut() {
             callback(is_active);
         }
+    }
+
+    /// Notify the window that it went on or off screen.
+    ///
+    /// Called by the FFI layer on background / foreground transitions — not
+    /// on active / inactive ones, since an inactive app (incoming call,
+    /// Control Center, App Switcher) is still being presented. Only
+    /// transitions reach the callback, as GPUI requires.
+    pub fn notify_visibility_change(&self, visibility: WindowVisibility) {
+        if self.visibility.replace(visibility) == visibility {
+            return;
+        }
+        log::info!("GPUI iOS: Window visibility changed to: {:?}", visibility);
+
         if let Some(callback) = self.visibility_callback.borrow_mut().as_mut() {
-            callback(if is_active {
-                WindowVisibility::Visible
-            } else {
-                WindowVisibility::Hidden
-            });
+            callback(visibility);
         }
     }
 
@@ -1424,11 +1387,7 @@ impl PlatformWindow for IosWindow {
     }
 
     fn visibility(&self) -> WindowVisibility {
-        if self.is_active() {
-            WindowVisibility::Visible
-        } else {
-            WindowVisibility::Hidden
-        }
+        self.visibility.get()
     }
 
     fn is_hovered(&self) -> bool {

@@ -186,7 +186,16 @@ pub type TouchCallback = Box<dyn FnMut(TouchPoint) + Send + 'static>;
 pub type ActiveStatusCallback = Box<dyn FnMut(bool) + Send + 'static>;
 
 /// Called when the window becomes visible or hidden.
-pub type VisibilityCallback = Box<dyn FnMut(bool) + Send + 'static>;
+pub type VisibilityCallback = Box<dyn FnMut(WindowVisibility) + Send + 'static>;
+
+/// Android windows are on screen exactly while the activity is resumed.
+fn visibility_from_active(active: bool) -> WindowVisibility {
+    if active {
+        WindowVisibility::Visible
+    } else {
+        WindowVisibility::Hidden
+    }
+}
 
 /// Called when a key event arrives.
 pub type KeyCallback = Box<dyn FnMut(AndroidKeyEvent) + Send + 'static>;
@@ -784,8 +793,8 @@ impl AndroidWindow {
             // holding the window state lock.  The callback wraps a GPUI
             // closure that acquires its own Mutex (and may call back into
             // GPUI), so calling it under the state lock deadlocks.
-            let mut taken_cb: Option<Box<dyn FnMut(bool) + Send>> = None;
-            let mut visibility_cb: Option<Box<dyn FnMut(bool) + Send>> = None;
+            let mut taken_cb: Option<ActiveStatusCallback> = None;
+            let mut visibility_cb: Option<VisibilityCallback> = None;
             if let Some(mut state) = self.state.try_lock() {
                 state.is_active = active;
                 taken_cb = state.active_status_callback.take();
@@ -805,7 +814,7 @@ impl AndroidWindow {
                 }
             }
             if let Some(mut cb) = visibility_cb {
-                cb(active);
+                cb(visibility_from_active(active));
                 if let Some(mut state) = self.state.try_lock() {
                     state.visibility_callback = Some(cb);
                 }
@@ -996,7 +1005,7 @@ impl AndroidWindow {
 
     pub fn on_visibility_change<F>(&self, cb: F)
     where
-        F: FnMut(bool) + Send + 'static,
+        F: FnMut(WindowVisibility) + Send + 'static,
     {
         self.state.lock().visibility_callback = Some(Box::new(cb));
     }
@@ -1148,11 +1157,7 @@ impl PlatformWindow for AndroidPlatformWindow {
     }
 
     fn visibility(&self) -> WindowVisibility {
-        if self.window.is_active() {
-            WindowVisibility::Visible
-        } else {
-            WindowVisibility::Hidden
-        }
+        visibility_from_active(self.window.is_active())
     }
 
     fn window_bounds(&self) -> WindowBounds {
@@ -1447,16 +1452,15 @@ impl PlatformWindow for AndroidPlatformWindow {
     }
 
     fn on_visibility_change(&self, callback: Box<dyn FnMut(WindowVisibility)>) {
+        // Same shape as on_active_status_change: PlatformWindow gives us a
+        // non-Send Box, AndroidWindow requires Send, and the callback is only
+        // ever invoked on the main thread (from set_active).
         let send_callback: Box<dyn FnMut(WindowVisibility) + Send> =
             unsafe { std::mem::transmute(callback) };
         let send_callback = Mutex::new(send_callback);
-        self.window.on_visibility_change(move |visible| {
+        self.window.on_visibility_change(move |visibility| {
             let mut cb = send_callback.lock();
-            cb(if visible {
-                WindowVisibility::Visible
-            } else {
-                WindowVisibility::Hidden
-            });
+            cb(visibility);
         });
     }
 
