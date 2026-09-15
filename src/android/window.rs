@@ -560,7 +560,7 @@ impl AndroidWindow {
 
     /// Fire GPUI's resize callback with the dimensions currently stored for this
     /// window, whether or not they differ from what GPUI last saw.
-    pub fn notify_resize(&self) {
+    fn notify_resize(&self) {
         let (width, height, scale) = {
             let state = self.state.lock();
             (state.width, state.height, state.scale_factor)

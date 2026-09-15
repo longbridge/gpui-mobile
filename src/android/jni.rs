@@ -86,9 +86,8 @@ use android_activity::{AndroidApp, MainEvent, PollEvent};
 use super::platform::{AndroidPlatform, SharedPlatform};
 
 use jni::objects::{JObject, JString, JValue};
-use std::sync::atomic::AtomicPtr;
-
 use jni::JavaVM;
+use std::sync::{atomic::AtomicPtr, Mutex};
 
 // ── JNI helpers (safe `jni` crate wrappers) ──────────────────────────────────
 
@@ -271,21 +270,48 @@ pub fn unicode_char_for_key_event(key_code: i32, action: i32, meta_state: i32) -
 
 // ── public accessors ──────────────────────────────────────────────────────────
 
-/// JVM + current Activity for the **host-driven** entry point ([`super::host`]),
-/// which has no `AndroidApp` to read them from. Set from `JNI_OnLoad`-style init
-/// on the Java UI thread; re-set on every Activity creation so the pointers below
-/// always name the *live* Activity.
+/// JVM for the **host-driven** entry point ([`super::host`]), which has no
+/// `AndroidApp` to read it from.
 static HOST_VM: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static HOST_ACTIVITY: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
-/// Supply the JVM and the current Activity when running without `android-activity`.
+/// Current Activity for the host-driven entry point, as a JNI global reference we
+/// own. Replaced on every Activity creation so [`activity_as_ptr`] always names the
+/// *live* Activity.
 ///
-/// # Safety
-/// `activity` must be a **global** JNI reference that the caller keeps alive for
-/// as long as that Activity is the current one.
-pub unsafe fn set_host_jvm(vm: *mut c_void, activity: *mut c_void) {
-    HOST_VM.store(vm, std::sync::atomic::Ordering::SeqCst);
-    HOST_ACTIVITY.store(activity, std::sync::atomic::Ordering::SeqCst);
+/// The outgoing reference is kept one generation longer: `activity_as_ptr` hands out a
+/// raw `jobject`, and a call on the render thread may still be using the previous
+/// Activity while the UI thread installs the next one.
+static HOST_ACTIVITY: Mutex<HostActivity> = Mutex::new(HostActivity {
+    current: None,
+    previous: None,
+});
+
+struct HostActivity {
+    current: Option<jni::refs::Global<JObject<'static>>>,
+    previous: Option<jni::refs::Global<JObject<'static>>>,
+}
+
+/// Register the current Activity when running without `android-activity`.
+///
+/// Call from a JNI entry point in `Activity.onCreate`, every time — a recreated
+/// Activity is a new object. This module takes its own global reference and records
+/// the JVM, so `java_vm()` / `activity_as_ptr()` and everything built on them (IME,
+/// safe areas, file pickers, `rustls-platform-verifier`) work exactly as on the
+/// `android-activity` path. A no-op when `android-activity` owns the process.
+pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<(), String> {
+    if ANDROID_APP.get().is_some() {
+        return Ok(());
+    }
+    let global = env.new_global_ref(activity).e()?;
+    let vm = env.get_java_vm().e()?;
+    HOST_VM.store(
+        vm.get_raw() as *mut c_void,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let mut slot = HOST_ACTIVITY.lock().expect("poisoned");
+    slot.previous = slot.current.take();
+    slot.current = Some(global);
+    Ok(())
 }
 
 /// Public accessor for the JavaVM pointer.
@@ -312,7 +338,15 @@ pub fn activity_as_ptr() -> *mut c_void {
     ANDROID_APP
         .get()
         .map(|app| app.activity_as_ptr())
-        .unwrap_or_else(|| HOST_ACTIVITY.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or_else(|| {
+            HOST_ACTIVITY
+                .lock()
+                .expect("poisoned")
+                .current
+                .as_ref()
+                .map(|activity| activity.as_raw() as *mut c_void)
+                .unwrap_or(std::ptr::null_mut())
+        })
 }
 
 /// Returns a clone of the stored `AndroidApp`, if initialised.
@@ -324,8 +358,10 @@ pub fn android_app() -> Option<AndroidApp> {
 ///
 /// The `android-activity` path calls `init_platform` instead; both end up in the same
 /// slot so every accessor in this module keeps working regardless of entry point.
-pub fn set_host_platform(platform: Arc<AndroidPlatform>) {
-    let _ = PLATFORM.set(platform);
+pub(crate) fn set_host_platform(platform: Arc<AndroidPlatform>) {
+    if PLATFORM.set(platform).is_err() {
+        log::warn!("set_host_platform: PLATFORM already set — both entry points in one process?");
+    }
 }
 
 /// Returns a reference to the global `AndroidPlatform`, if initialised.
@@ -1238,9 +1274,9 @@ static SHOWN_KEYBOARD: std::sync::Mutex<Option<crate::KeyboardType>> = std::sync
 
 /// Re-request the keyboard on the current Activity if one was showing.
 ///
-/// Call after a recreated Activity has registered itself and laid out its content view.
-/// A fresh IME session is started, which is what we want: the proxy is a new object.
-pub fn restore_keyboard() {
+/// Called by [`super::host`] once a recreated Activity's surface is attached. A fresh
+/// IME session is started, which is what we want: the proxy is a new object.
+pub(crate) fn restore_keyboard() {
     let keyboard_type = *SHOWN_KEYBOARD.lock().expect("poisoned");
     if let Some(keyboard_type) = keyboard_type {
         log::info!("restore_keyboard: re-showing {keyboard_type:?} on the new Activity");

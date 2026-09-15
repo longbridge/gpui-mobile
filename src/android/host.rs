@@ -19,27 +19,45 @@
 //! This module is **additive**: the `android-activity` path is untouched, so both
 //! entry points can coexist while hosts migrate.
 //!
+//! # What the host has to do
+//!
+//! From the Java UI thread, in this order:
+//!
+//! 1. In `Activity.onCreate` — every time, recreation included — call
+//!    [`super::jni::set_host_activity`] from a JNI entry point, then [`start`] (a no-op
+//!    after the first call).
+//! 2. From `SurfaceHolder.Callback`: [`surface_created`] in both `surfaceCreated` and
+//!    `surfaceChanged`, [`surface_destroyed`] in `surfaceDestroyed`.
+//! 3. From `onResume` / `onPause`: [`resumed`] / [`paused`].
+//! 4. From `onTouchEvent`, `dispatchKeyEvent` and the `InputConnection`:
+//!    [`motion_event`], [`key`], [`ime_event`].
+//!
+//! The Activity must also expose the Java methods `jni.rs` calls back into for the IME
+//! (`gpuiShowKeyboard`, `gpuiHideKeyboard`, `gpuiResetComposition`); `GpuiInputActivity`
+//! in the example project is the reference implementation.
+//!
 //! # Threading contract
 //!
 //! - `render thread` — owns the `ALooper`, the `AndroidPlatform`, GPUI's `App` and the
-//!   `ApplicationHandle`. Everything GPUI touches stays here.
-//! - `Java UI thread` — calls the `surface_*` / `lifecycle_*` / `dispatch_*` functions
-//!   below. They only touch the command queue and the window slot, never GPUI state.
+//!   `ApplicationHandle` that keeps it alive. Everything GPUI touches stays here.
+//! - `Java UI thread` — calls the functions below. They only touch the command queue
+//!   and a few atomics, never GPUI state.
 //! - [`surface_destroyed`] **blocks** until the render thread has stopped using the
 //!   surface. That wait is mandatory: destroying a `Surface` while a thread sits inside
 //!   `ANativeWindow_lock` is a use-after-free.
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicPtr, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
 
+use gpui::{App, Application, ApplicationHandle};
 use ndk::native_window::NativeWindow;
 
-use super::platform::AndroidPlatform;
+use super::platform::{AndroidPlatform, SharedPlatform};
 use crate::android::{AndroidKeyEvent, TouchPoint};
 
 /// The render thread's `ALooper`, so other threads can wake it.
@@ -53,6 +71,10 @@ static STARTED: OnceLock<()> = OnceLock::new();
 
 /// Cleared by the render thread once it has released the outgoing surface.
 static SURFACE_RELEASED: AtomicBool = AtomicBool::new(true);
+
+/// Scale factor of the current surface (`f32` bits), for the platform-view hit test
+/// in [`motion_event`], which runs on the Java UI thread and must not touch the window.
+static SCALE_BITS: AtomicU32 = AtomicU32::new(0);
 
 /// The `ANativeWindow` the renderer is currently attached to.
 ///
@@ -80,6 +102,34 @@ enum Command {
     Key(AndroidKeyEvent),
 }
 
+/// `MotionEvent.getActionMasked()` values.
+const ACTION_DOWN: u32 = 0;
+const ACTION_UP: u32 = 1;
+const ACTION_MOVE: u32 = 2;
+const ACTION_CANCEL: u32 = 3;
+const ACTION_POINTER_DOWN: u32 = 5;
+const ACTION_POINTER_UP: u32 = 6;
+
+/// One pointer of a `MotionEvent`, in physical pixels relative to the surface.
+#[derive(Debug, Clone, Copy)]
+pub struct Pointer {
+    /// `MotionEvent.getPointerId(i)`.
+    pub id: i32,
+    pub x: f32,
+    pub y: f32,
+}
+
+type Launch = Box<dyn FnOnce(&mut App) + Send>;
+
+/// GPUI's application, owned by the render thread.
+struct HostApp {
+    /// Consumed when the first surface arrives.
+    launch: Option<Launch>,
+    /// Keeps the `App` alive: `Platform::run` returns immediately on this path, so
+    /// nothing else holds the `Rc<AppCell>`.
+    handle: Option<ApplicationHandle>,
+}
+
 fn post(command: Command) {
     COMMANDS.lock().expect("poisoned").push(command);
     wake_render_thread();
@@ -96,13 +146,14 @@ fn wake_render_thread() {
 /// Start the render thread. Idempotent — later calls are no-ops, which is what makes
 /// an Activity recreation cheap: the thread, the platform and the GPUI `App` all survive.
 ///
-/// `launch` runs **on the render thread** once the first surface is available. Use it to
-/// build the UI exactly as you would inside `Application::run`'s closure.
+/// `launch` runs **on the render thread** once the first surface is available, with
+/// the same `&mut App` an `Application::run` closure gets. The application is built
+/// with `Application::run_embedded` and kept alive by this module.
 pub fn start<F>(launch: F)
 where
-    F: FnOnce() + Send + 'static,
+    F: FnOnce(&mut App) + Send + 'static,
 {
-    let mut launch = Some(launch);
+    let mut launch: Option<Launch> = Some(Box::new(launch));
     STARTED.get_or_init(move || {
         std::thread::Builder::new()
             .name("gpui-main".into())
@@ -111,7 +162,7 @@ where
     });
 }
 
-fn render_thread<F: FnOnce()>(launch: F) {
+fn render_thread(launch: Launch) {
     // SAFETY: called once, on this thread, before anything registers with the looper.
     let looper = unsafe { ndk_sys::ALooper_prepare(0) };
     assert!(
@@ -126,7 +177,10 @@ fn render_thread<F: FnOnce()>(launch: F) {
     let platform = Arc::new(AndroidPlatform::new(false));
     super::jni::set_host_platform(Arc::clone(&platform));
 
-    let mut launched = Some(launch);
+    let mut app = HostApp {
+        launch: Some(launch),
+        handle: None,
+    };
 
     loop {
         // Drain into a local first: a `for` over `COMMANDS.lock()…` would keep the
@@ -137,7 +191,7 @@ fn render_thread<F: FnOnce()>(launch: F) {
         for command in commands {
             match command {
                 Command::SurfaceCreated { window, scale } => {
-                    on_surface_created(&platform, window, scale, &mut launched);
+                    on_surface_created(&platform, window, scale, &mut app);
                 }
                 Command::SurfaceDestroyed => {
                     if let Some(win) = platform.primary_window() {
@@ -194,11 +248,11 @@ fn render_thread<F: FnOnce()>(launch: F) {
     }
 }
 
-fn on_surface_created<F: FnOnce()>(
+fn on_surface_created(
     platform: &Arc<AndroidPlatform>,
     window: NativeWindow,
     scale: f32,
-    launched: &mut Option<F>,
+    app: &mut HostApp,
 ) {
     SURFACE_RELEASED.store(false, Ordering::SeqCst);
 
@@ -220,6 +274,9 @@ fn on_surface_created<F: FnOnce()>(
             Ok(()) => {
                 CURRENT_SURFACE.store(incoming, Ordering::SeqCst);
                 log::info!("gpui-main: surface re-attached to existing window");
+                // The Java `InputProxy` died with the old Activity while GPUI still
+                // considers the same field focused; ask the new Activity for the IME.
+                super::jni::restore_keyboard();
             }
             Err(err) => log::error!("gpui-main: init_window failed: {err:#}"),
         }
@@ -233,19 +290,23 @@ fn on_surface_created<F: FnOnce()>(
             CURRENT_SURFACE.store(incoming, Ordering::SeqCst);
             win.set_active(true);
             log::info!("gpui-main: first window opened");
-            if let Some(launch) = launched.take() {
-                launch();
+            if let Some(launch) = app.launch.take() {
+                // Without an `AndroidApp` to drive, `AndroidPlatform::run` invokes the
+                // callback immediately and returns — the shape `run_embedded` expects.
+                // The handle is what keeps the `App` alive afterwards.
+                let application =
+                    Application::with_platform(SharedPlatform::new(Arc::clone(platform)).into_rc());
+                app.handle = Some(application.run_embedded(launch));
             }
         }
         Err(err) => log::error!("gpui-main: open_window failed: {err:#}"),
     }
 }
 
-/// Hand a new `Surface` to the render thread. Safe to call repeatedly.
-///
-/// # Safety
-/// `window` must be a live `ANativeWindow` obtained from `ANativeWindow_fromSurface`.
+/// Hand a `Surface` to the render thread. Call from both `surfaceCreated` and
+/// `surfaceChanged`; a repeat of the surface already held is treated as a resize.
 pub fn surface_created(window: NativeWindow, scale: f32) {
+    SCALE_BITS.store(scale.to_bits(), Ordering::Relaxed);
     post(Command::SurfaceCreated { window, scale });
 }
 
@@ -271,14 +332,50 @@ pub fn surface_destroyed() {
     }
 }
 
-/// Deliver one pointer of a `MotionEvent`.
+/// Deliver a whole `MotionEvent`.
 ///
-/// `action` is an `AMOTION_EVENT_ACTION_*` value already reduced to a single pointer
-/// (`POINTER_DOWN`/`POINTER_UP` collapsed to `DOWN`/`UP` by the caller), matching what
-/// [`super::jni::process_input_events`] feeds the window on the `android-activity` path.
-/// Coordinates are in physical pixels, relative to the surface.
-pub fn touch(id: i32, action: u32, x: f32, y: f32) {
-    post(Command::Touch(TouchPoint { id, x, y, action }));
+/// `action` is `getActionMasked()`, `action_index` is `getActionIndex()`, and
+/// `pointers` lists every pointer in index order (`getPointerId(i)`, `getX(i)`,
+/// `getY(i)`), in physical pixels relative to the surface. The per-pointer fan-out
+/// (`POINTER_DOWN`/`POINTER_UP` collapsed to `DOWN`/`UP` for the affected pointer
+/// only) is the same one [`super::jni`] applies on the `android-activity` path.
+///
+/// Returns `false` when the touch lands on a platform view. The host should then
+/// return `false` from `onTouchEvent` so the Java view hierarchy handles it.
+pub fn motion_event(action: u32, action_index: usize, pointers: &[Pointer]) -> bool {
+    let registry = crate::platform_view::PlatformViewRegistry::global();
+    if registry.active_view_count() > 0 {
+        let primary_index = match action {
+            ACTION_POINTER_DOWN | ACTION_POINTER_UP => action_index,
+            _ => 0,
+        };
+        if let Some(primary) = pointers.get(primary_index) {
+            let scale = f32::from_bits(SCALE_BITS.load(Ordering::Relaxed)).max(f32::EPSILON);
+            if registry.hit_test(primary.x / scale, primary.y / scale) {
+                log::debug!("gpui-main: touch hits platform view, skipping GPUI dispatch");
+                return false;
+            }
+        }
+    }
+
+    for (index, pointer) in pointers.iter().enumerate() {
+        let touch_action = match action {
+            ACTION_DOWN => ACTION_DOWN,
+            ACTION_UP => ACTION_UP,
+            ACTION_MOVE => ACTION_MOVE,
+            ACTION_CANCEL => ACTION_CANCEL,
+            ACTION_POINTER_DOWN if index == action_index => ACTION_DOWN,
+            ACTION_POINTER_UP if index == action_index => ACTION_UP,
+            _ => continue,
+        };
+        post(Command::Touch(TouchPoint {
+            id: pointer.id,
+            x: pointer.x,
+            y: pointer.y,
+            action: touch_action,
+        }));
+    }
+    true
 }
 
 /// Deliver a key event. `action` is `0` for down and `1` for up.
