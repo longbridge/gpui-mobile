@@ -86,6 +86,8 @@ use android_activity::{AndroidApp, MainEvent, PollEvent};
 use super::platform::{AndroidPlatform, SharedPlatform};
 
 use jni::objects::{JObject, JString, JValue};
+use std::sync::atomic::AtomicPtr;
+
 use jni::JavaVM;
 
 // ── JNI helpers (safe `jni` crate wrappers) ──────────────────────────────────
@@ -269,6 +271,23 @@ pub fn unicode_char_for_key_event(key_code: i32, action: i32, meta_state: i32) -
 
 // ── public accessors ──────────────────────────────────────────────────────────
 
+/// JVM + current Activity for the **host-driven** entry point ([`super::host`]),
+/// which has no `AndroidApp` to read them from. Set from `JNI_OnLoad`-style init
+/// on the Java UI thread; re-set on every Activity creation so the pointers below
+/// always name the *live* Activity.
+static HOST_VM: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static HOST_ACTIVITY: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Supply the JVM and the current Activity when running without `android-activity`.
+///
+/// # Safety
+/// `activity` must be a **global** JNI reference that the caller keeps alive for
+/// as long as that Activity is the current one.
+pub unsafe fn set_host_jvm(vm: *mut c_void, activity: *mut c_void) {
+    HOST_VM.store(vm, std::sync::atomic::Ordering::SeqCst);
+    HOST_ACTIVITY.store(activity, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Public accessor for the JavaVM pointer.
 ///
 /// Uses `AndroidApp::vm_as_ptr()` from the stored `AndroidApp`.
@@ -277,7 +296,7 @@ pub fn java_vm() -> *mut c_void {
     ANDROID_APP
         .get()
         .map(|app| app.vm_as_ptr())
-        .unwrap_or(std::ptr::null_mut())
+        .unwrap_or_else(|| HOST_VM.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// Public accessor for the current Activity's JNI object reference.
@@ -293,12 +312,20 @@ pub fn activity_as_ptr() -> *mut c_void {
     ANDROID_APP
         .get()
         .map(|app| app.activity_as_ptr())
-        .unwrap_or(std::ptr::null_mut())
+        .unwrap_or_else(|| HOST_ACTIVITY.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// Returns a clone of the stored `AndroidApp`, if initialised.
 pub fn android_app() -> Option<AndroidApp> {
     ANDROID_APP.get().cloned()
+}
+
+/// Install the platform built by the host-driven path (`super::host`).
+///
+/// The `android-activity` path calls `init_platform` instead; both end up in the same
+/// slot so every accessor in this module keeps working regardless of entry point.
+pub fn set_host_platform(platform: Arc<AndroidPlatform>) {
+    let _ = PLATFORM.set(platform);
 }
 
 /// Returns a reference to the global `AndroidPlatform`, if initialised.
@@ -1201,11 +1228,32 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
 
 // ── software keyboard (IME) control ───────────────────────────────────────────
 
+/// The keyboard type currently requested, or `None` when hidden.
+///
+/// The Java-side `InputProxy` belongs to the Activity, so an Activity recreation takes
+/// the IME with it — while GPUI still considers the same field focused and therefore
+/// never asks for the keyboard again. Remembering the request lets a new Activity put
+/// the IME back; see [`restore_keyboard`].
+static SHOWN_KEYBOARD: std::sync::Mutex<Option<crate::KeyboardType>> = std::sync::Mutex::new(None);
+
+/// Re-request the keyboard on the current Activity if one was showing.
+///
+/// Call after a recreated Activity has registered itself and laid out its content view.
+/// A fresh IME session is started, which is what we want: the proxy is a new object.
+pub fn restore_keyboard() {
+    let keyboard_type = *SHOWN_KEYBOARD.lock().expect("poisoned");
+    if let Some(keyboard_type) = keyboard_type {
+        log::info!("restore_keyboard: re-showing {keyboard_type:?} on the new Activity");
+        show_keyboard_android(keyboard_type);
+    }
+}
+
 /// Show the UI-thread EditText proxy supplied by GpuiInputActivity.
 ///
 /// Unlike NativeActivity's key-event-only connection, its InputConnection
 /// supports composing text, commits and Unicode surrounding-text deletion.
 pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
+    *SHOWN_KEYBOARD.lock().expect("poisoned") = Some(keyboard_type);
     let kind = match keyboard_type {
         crate::KeyboardType::Default => 0,
         crate::KeyboardType::EmailAddress => 1,
@@ -1238,6 +1286,7 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
 ///
 /// Invalidates queued IME callbacks and clears the native composition buffer.
 pub fn hide_keyboard_android() {
+    *SHOWN_KEYBOARD.lock().expect("poisoned") = None;
     let session = super::text_input::new_session();
     let _ = with_env(|env| {
         let activity = activity(env)?;
