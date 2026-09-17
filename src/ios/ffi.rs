@@ -509,6 +509,30 @@ pub fn set_app_callback(cb: Box<dyn FnOnce(&mut App)>) {
     }
 }
 
+// An app-provided asset source for `run_app`: without one the Application
+// is built with the unit asset source, so every kit `Icon` paints a blank
+// slot. Main thread only, like the app callback; a second call keeps the
+// first source.
+static APP_ASSETS: OnceLock<std::sync::Arc<dyn gpui::AssetSource>> = OnceLock::new();
+
+/// Register the asset source `run_app` installs via `with_assets`. Call this
+/// before `run_app`, alongside [`set_app_callback`].
+pub fn set_app_assets(source: std::sync::Arc<dyn gpui::AssetSource>) {
+    let _ = APP_ASSETS.set(source);
+}
+
+struct AppAssets(std::sync::Arc<dyn gpui::AssetSource>);
+
+impl gpui::AssetSource for AppAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        self.0.load(path)
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
+        self.0.list(path)
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn take_app_callback() -> Option<Box<dyn FnOnce(&mut App)>> {
     APP_CALLBACK
@@ -545,7 +569,14 @@ pub fn run_app() {
     }
 
     let platform = Rc::new(super::IosPlatform::new());
-    let application = Application::with_platform(platform).run_embedded(|cx: &mut App| {
+    // Install the app-provided asset source when one was registered;
+    // without it kit icons paint blank.
+    let application = Application::with_platform(platform);
+    let application = match APP_ASSETS.get() {
+        Some(source) => application.with_assets(AppAssets(source.clone())),
+        None => application,
+    };
+    let application = application.run_embedded(|cx: &mut App| {
         if let Some(cb) = take_app_callback() {
             log::info!("GPUI iOS: Invoking user-provided app callback");
             cb(cx);
