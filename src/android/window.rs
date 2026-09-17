@@ -97,6 +97,19 @@ type SetFrameRateFn = unsafe extern "C" fn(*mut ndk_sys::ANativeWindow, f32, i8)
 type SetFrameRateWithChangeStrategyFn =
     unsafe extern "C" fn(*mut ndk_sys::ANativeWindow, f32, i8, i8) -> i32;
 
+/// Invoke a window callback without letting a panic escape or orphan the
+/// callback. Every registration site below takes the callback out of the
+/// state lock before invoking it and puts it back after; a panic unwinding
+/// through the invocation skips the put-back, permanently dropping that
+/// path (the 2026-09-16 wedge: `gpui_wgpu` panics after 10 consecutive GPU
+/// frame errors, and when that unwound through the touch callback every
+/// later touch hit "NO touch_callback registered" until force-stop).
+fn call_unwind_guarded(what: &str, f: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+        log::error!("AndroidWindow: {what} callback panicked; callback kept registered");
+    }
+}
+
 const DEFAULT_FRAME_RATE_COMPATIBILITY: i8 = 0;
 const ONLY_IF_SEAMLESS: i8 = 0;
 const HIGH_FRAME_RATE: f32 = 120.0;
@@ -580,13 +593,11 @@ impl AndroidWindow {
             state.resize_callback.take()
         };
         if let Some(mut cb) = cb {
-            cb(
-                Size {
-                    width: DevicePixels(width),
-                    height: DevicePixels(height),
-                },
-                scale,
-            );
+            let size = Size {
+                width: DevicePixels(width),
+                height: DevicePixels(height),
+            };
+            call_unwind_guarded("resize", || cb(size, scale));
             let mut state = self.state.lock();
             if state.resize_callback.is_none() {
                 state.resize_callback = Some(cb);
@@ -675,13 +686,11 @@ impl AndroidWindow {
             state.resize_callback.take()
         };
         if let Some(mut cb) = cb {
-            cb(
-                Size {
-                    width: DevicePixels(new_w),
-                    height: DevicePixels(new_h),
-                },
-                scale,
-            );
+            let size = Size {
+                width: DevicePixels(new_w),
+                height: DevicePixels(new_h),
+            };
+            call_unwind_guarded("resize", || cb(size, scale));
             // Put callback back.
             let mut state = self.state.lock();
             if state.resize_callback.is_none() {
@@ -778,7 +787,7 @@ impl AndroidWindow {
         };
 
         if let Some(mut cb) = cb {
-            cb();
+            call_unwind_guarded("request_frame", || cb());
 
             // Put the callback back so it fires again next frame.
             let mut state = self.state.lock();
@@ -809,7 +818,7 @@ impl AndroidWindow {
                 point.id, point.action, point.x, point.y,
                 point.x / scale, point.y / scale, scale,
             );
-            cb(point);
+            call_unwind_guarded("touch", || cb(point));
             let mut state = self.state.lock();
             if state.touch_callback.is_none() {
                 state.touch_callback = Some(cb);
@@ -830,7 +839,7 @@ impl AndroidWindow {
             state.key_callback.take()
         };
         if let Some(mut cb) = cb {
-            cb(event);
+            call_unwind_guarded("key", || cb(event));
             let mut state = self.state.lock();
             if state.key_callback.is_none() {
                 state.key_callback = Some(cb);
@@ -858,7 +867,7 @@ impl AndroidWindow {
                 state.appearance_callback.take()
             };
             if let Some(mut cb) = cb {
-                cb(appearance);
+                call_unwind_guarded("appearance", || cb(appearance));
                 let mut state = self.state.lock();
                 if state.appearance_callback.is_none() {
                     state.appearance_callback = Some(cb);
@@ -902,14 +911,14 @@ impl AndroidWindow {
             }
             // Fire callback outside the lock.
             if let Some(mut cb) = taken_cb {
-                cb(active);
+                call_unwind_guarded("active_status", || cb(active));
                 // Put it back so future calls still fire.
                 if let Some(mut state) = self.state.try_lock() {
                     state.active_status_callback = Some(cb);
                 }
             }
             if let Some(mut cb) = visibility_cb {
-                cb(active);
+                call_unwind_guarded("visibility", || cb(active));
                 if let Some(mut state) = self.state.try_lock() {
                     state.visibility_callback = Some(cb);
                 }
@@ -2173,6 +2182,42 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert!(matches!(&events[2], gpui::PlatformInput::Touch(event)
             if event.phase == gpui::TouchPhase::Cancelled));
+    }
+
+    #[test]
+    fn panicking_touch_callback_is_not_lost() {
+        let w = AndroidWindow::headless(1080, 1920, 2.0);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        w.on_touch(move |_| {
+            c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            panic!("renderer failure inside dispatch must not orphan the callback");
+        });
+        let point = TouchPoint {
+            id: 1,
+            x: 100.0,
+            y: 200.0,
+            action: 0,
+        };
+        w.handle_touch(point.clone());
+        // The guard caught the panic and restored the callback: later
+        // touches still dispatch instead of hitting "NO touch_callback".
+        w.handle_touch(point);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn panicking_request_frame_callback_is_not_lost() {
+        let w = AndroidWindow::headless(1080, 1920, 2.0);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        w.on_request_frame(move || {
+            c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            panic!("GPU failure inside the frame callback must not orphan it");
+        });
+        w.request_frame();
+        w.request_frame();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]
