@@ -77,7 +77,7 @@ impl IosPlatformView {
     fn create_native_view(
         view_type: &str,
         bounds: &PlatformViewBounds,
-        params: &PlatformViewParams,
+        _params: &PlatformViewParams,
     ) -> Result<*mut AnyObject, String> {
         unsafe {
             let frame = ObjcCGRect::new(
@@ -88,9 +88,18 @@ impl IosPlatformView {
             );
 
             let view: *mut AnyObject = match view_type {
-                "video_player" => Self::create_video_player_view(frame, params)?,
-                "webview" => Self::create_webview_view(frame, params)?,
-                "camera_preview" => Self::create_camera_preview_view(frame, params)?,
+                #[cfg(feature = "video_player")]
+                "video_player" => Self::create_video_player_view(frame, _params)?,
+                #[cfg(not(feature = "video_player"))]
+                "video_player" => return Err("video_player feature is disabled".into()),
+                #[cfg(feature = "webview")]
+                "webview" => Self::create_webview_view(frame, _params)?,
+                #[cfg(not(feature = "webview"))]
+                "webview" => return Err("webview feature is disabled".into()),
+                #[cfg(feature = "camera")]
+                "camera_preview" => Self::create_camera_preview_view(frame, _params)?,
+                #[cfg(not(feature = "camera"))]
+                "camera_preview" => return Err("camera feature is disabled".into()),
                 _ => Self::create_generic_view(frame)?,
             };
 
@@ -129,7 +138,7 @@ impl IosPlatformView {
     }
 
     /// Create a UIView with an AVPlayerLayer for video playback.
-    #[cfg(target_os = "ios")]
+    #[cfg(all(target_os = "ios", feature = "video_player"))]
     unsafe fn create_video_player_view(
         frame: ObjcCGRect,
         params: &PlatformViewParams,
@@ -169,7 +178,7 @@ impl IosPlatformView {
     }
 
     /// Create a WKWebView.
-    #[cfg(target_os = "ios")]
+    #[cfg(all(target_os = "ios", feature = "webview"))]
     unsafe fn create_webview_view(
         frame: ObjcCGRect,
         params: &PlatformViewParams,
@@ -224,7 +233,7 @@ impl IosPlatformView {
     }
 
     /// Create a UIView with AVCaptureVideoPreviewLayer for camera preview.
-    #[cfg(target_os = "ios")]
+    #[cfg(all(target_os = "ios", feature = "camera"))]
     unsafe fn create_camera_preview_view(
         frame: ObjcCGRect,
         params: &PlatformViewParams,
@@ -261,7 +270,10 @@ impl IosPlatformView {
         Ok(view)
     }
 
-    #[cfg(target_os = "ios")]
+    #[cfg(all(
+        target_os = "ios",
+        any(feature = "camera", feature = "video_player", feature = "webview")
+    ))]
     unsafe fn make_nsstring(s: &str) -> *mut AnyObject {
         crate::ios::util::nsstring(s)
     }
