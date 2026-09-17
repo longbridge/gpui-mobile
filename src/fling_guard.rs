@@ -10,14 +10,20 @@
 //! fling's axis is the new contact's own); this guard is what the platform
 //! can do about it until that reaches a release.
 //!
+//! The same catch also swallows control drags: a contact that catches a
+//! fling is never offered as a touch drag, so a scrollbar thumb — visible only
+//! while its content scrolls and coasts — could not be grabbed until the
+//! coasting had been stopped by an earlier touch.
+//!
 //! The recognizer takes its momentum on *every* `Started`, and a contact that
 //! is cancelled while still pending emits nothing. So before a real contact
 //! that may land on momentum, the guard relays a synthetic contact that begins
 //! and is cancelled at the same point: it stops the momentum (a zero-delta
 //! `Started`/`Cancelled` scroll pair the consumers treat as a no-op), and the
-//! real contact then begins on an idle recognizer, which decides its axis from
-//! the contact's own first movement past the slop. When no momentum is left
-//! the synthetic pair is a no-op (a pending contact cancelled emits nothing).
+//! real contact then begins on an idle recognizer, which offers it as a drag
+//! and otherwise decides its axis from the contact's own first movement past
+//! the slop. When no momentum is left the synthetic pair is a no-op (a pending
+//! contact cancelled emits nothing).
 //!
 //! The recognizer's momentum is not visible from the platform, so the guard
 //! estimates it: momentum can only follow the release of a contact that
@@ -299,5 +305,98 @@ mod tests {
             relayed,
             [(2, TouchPhase::Started, point(px(300.), px(300.)))]
         );
+    }
+
+    /// The guard's purpose, end to end: GPUI's recognizer never offers a
+    /// contact that catches a fling as a touch drag, so a control that claims
+    /// drags (a scrollbar thumb) cannot be grabbed while its content coasts.
+    #[gpui::test]
+    fn a_contact_that_lands_on_a_fling_is_still_offered_as_a_drag(cx: &mut gpui::TestAppContext) {
+        use gpui::{
+            canvas, div, Context, IntoElement, ParentElement, Render, Styled, TouchDragEvent,
+            Window,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        /// Claims drags that begin in a strip along the right edge, the way
+        /// a scrollbar thumb does; the rest of the window pans.
+        struct DragClaimer {
+            claimed: Rc<Cell<usize>>,
+        }
+
+        const THUMB_LEFT: Pixels = px(90.);
+
+        impl Render for DragClaimer {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let claimed = self.claimed.clone();
+                div().size_full().child(
+                    canvas(
+                        |_, _, _| (),
+                        move |_, _, window, _| {
+                            let claimed = claimed.clone();
+                            window.on_mouse_event(
+                                move |event: &TouchDragEvent, phase, window, cx| {
+                                    if phase.bubble()
+                                        && event.phase == TouchPhase::Started
+                                        && event.start_position.x >= THUMB_LEFT
+                                    {
+                                        claimed.set(claimed.get() + 1);
+                                        window.prevent_default();
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            );
+                        },
+                    )
+                    .size_full(),
+                )
+            }
+        }
+
+        for guarded in [false, true] {
+            let claimed = Rc::new(Cell::new(0));
+            let (_, cx) = cx.add_window_view({
+                let claimed = claimed.clone();
+                move |_, _| DragClaimer { claimed }
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let mut guard = FlingGuard::new();
+            let mut next_id = 100;
+            let mut relay = |event: TouchEvent, cx: &mut gpui::VisualTestContext| {
+                if guarded {
+                    guard.relay(
+                        event,
+                        || {
+                            next_id += 1;
+                            TouchId(next_id)
+                        },
+                        |event| cx.simulate_event(event),
+                    );
+                } else {
+                    cx.simulate_event(event);
+                }
+            };
+
+            // A fast upward swipe, released with velocity: the recognizer is
+            // now coasting.
+            relay(touch(1, TouchPhase::Started, 50., 400.), cx);
+            for step in 1..=6 {
+                relay(
+                    touch(1, TouchPhase::Moved, 50., 400. - 40. * step as f32),
+                    cx,
+                );
+            }
+            relay(touch(1, TouchPhase::Ended, 50., 160.), cx);
+            assert_eq!(claimed.get(), 0, "a swipe is a pan, not a drag");
+
+            // A contact that lands while it coasts.
+            relay(touch(2, TouchPhase::Started, 95., 20.), cx);
+            relay(touch(2, TouchPhase::Ended, 95., 20.), cx);
+            assert_eq!(
+                claimed.get(),
+                usize::from(guarded),
+                "guarded={guarded}: only a guarded contact is offered as a drag"
+            );
+        }
     }
 }
