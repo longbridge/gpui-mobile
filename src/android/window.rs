@@ -1032,7 +1032,7 @@ impl AndroidWindow {
     /// Returns GPU specs from the renderer, if available.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         let state = self.state.lock();
-        state.renderer.as_ref().map(|r| r.gpu_specs())
+        state.renderer.as_ref().and_then(|r| r.gpu_specs())
     }
 
     /// Whether the window is currently active / visible.

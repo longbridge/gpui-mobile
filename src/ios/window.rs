@@ -1593,7 +1593,7 @@ impl PlatformWindow for IosWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         let guard = self.renderer.lock();
-        guard.as_ref().map(|r| r.gpu_specs())
+        guard.as_ref().and_then(|r| r.gpu_specs())
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
