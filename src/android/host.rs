@@ -27,7 +27,7 @@
 //!    [`super::jni::set_host_activity`] from a JNI entry point, then [`start`] (a no-op
 //!    after the first call).
 //! 2. From `SurfaceHolder.Callback`: [`surface_created`] in both `surfaceCreated` and
-//!    `surfaceChanged`, [`surface_destroyed`] in `surfaceDestroyed`.
+//!    `surfaceChanged`, [`surface_destroyed_for`] in `surfaceDestroyed`.
 //! 3. From `onResume` / `onPause`: [`resumed`] / [`paused`].
 //! 4. From `onTouchEvent`, `dispatchKeyEvent` and the `InputConnection`:
 //!    [`motion_event`], [`key`], [`ime_event`].
@@ -50,7 +50,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
+        atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::Duration,
@@ -71,8 +71,10 @@ static COMMANDS: Mutex<Vec<Command>> = Mutex::new(Vec::new());
 /// Set once the render thread is running; guards against a second spawn.
 static STARTED: OnceLock<()> = OnceLock::new();
 
-/// Cleared by the render thread once it has released the outgoing surface.
-static SURFACE_RELEASED: AtomicBool = AtomicBool::new(true);
+/// Surface-destroy requests posted by the UI thread, and how many of them the render
+/// thread has handled; [`surface_destroyed`] waits for its own request to be handled.
+static DESTROYS_REQUESTED: AtomicU64 = AtomicU64::new(0);
+static DESTROYS_HANDLED: AtomicU64 = AtomicU64::new(0);
 
 /// Scale factor of the current surface (`f32` bits), for the platform-view hit test
 /// in [`motion_event`], which runs on the Java UI thread and must not touch the window.
@@ -95,7 +97,10 @@ enum Command {
         window: NativeWindow,
         scale: f32,
     },
-    SurfaceDestroyed,
+    /// The `ANativeWindow` going away, when the host knows it. A recreated Activity's
+    /// new surface can arrive before the old Activity's `surfaceDestroyed`; only the
+    /// surface the renderer is attached to may be torn down.
+    SurfaceDestroyed(Option<usize>),
     Resumed,
     Paused,
     /// Input arrives on the Java UI thread but GPUI may only be touched from the
@@ -219,13 +224,18 @@ fn render_thread(launch: Launch) {
                 Command::SurfaceCreated { window, scale } => {
                     on_surface_created(&platform, window, scale, &mut app);
                 }
-                Command::SurfaceDestroyed => {
-                    if let Some(win) = platform.primary_window() {
-                        // Keeps the renderer (and its atlas) alive; only the surface goes.
-                        win.term_window();
+                Command::SurfaceDestroyed(surface) => {
+                    let current = CURRENT_SURFACE.load(Ordering::SeqCst) as usize;
+                    if surface.is_none_or(|surface| surface == current) {
+                        if let Some(win) = platform.primary_window() {
+                            // Keeps the renderer (and its atlas) alive; only the surface goes.
+                            win.term_window();
+                        }
+                        CURRENT_SURFACE.store(std::ptr::null_mut(), Ordering::SeqCst);
+                    } else {
+                        log::info!("gpui-main: ignoring destroy of a surface no longer attached");
                     }
-                    CURRENT_SURFACE.store(std::ptr::null_mut(), Ordering::SeqCst);
-                    SURFACE_RELEASED.store(true, Ordering::SeqCst);
+                    DESTROYS_HANDLED.fetch_add(1, Ordering::SeqCst);
                 }
                 Command::Resumed => {
                     platform.did_become_active();
@@ -288,8 +298,6 @@ fn on_surface_created(
     scale: f32,
     app: &mut HostApp,
 ) {
-    SURFACE_RELEASED.store(false, Ordering::SeqCst);
-
     let incoming = window.ptr().as_ptr();
     if CURRENT_SURFACE.load(Ordering::SeqCst) == incoming {
         // `surfaceChanged` for a surface we are already rendering into: the size may
@@ -352,13 +360,27 @@ pub fn surface_created(window: NativeWindow, scale: f32) {
 /// Call this from `SurfaceHolder.Callback.surfaceDestroyed` before returning to the
 /// framework, otherwise the `Surface` is torn down underneath a thread that may be
 /// inside `ANativeWindow_lock`.
+///
+/// Prefer [`surface_destroyed_for`]: without the window, a late destroy from a
+/// recreated Activity's old surface also tears down the new one.
 pub fn surface_destroyed() {
-    post(Command::SurfaceDestroyed);
+    destroy_and_wait(None);
+}
+
+/// Like [`surface_destroyed`], naming the `Surface` that is going away, so a destroy
+/// that arrives after a newer surface was attached leaves the newer one alone.
+pub fn surface_destroyed_for(window: &NativeWindow) {
+    destroy_and_wait(Some(window.ptr().as_ptr() as usize));
+}
+
+fn destroy_and_wait(surface: Option<usize>) {
+    let request = DESTROYS_REQUESTED.fetch_add(1, Ordering::SeqCst) + 1;
+    post(Command::SurfaceDestroyed(surface));
 
     // Bounded wait: a stuck render thread must not turn into an ANR. 2 s is far below
     // the 5 s input-dispatch timeout while being far above a worst-case frame.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !SURFACE_RELEASED.load(Ordering::SeqCst) {
+    while DESTROYS_HANDLED.load(Ordering::SeqCst) < request {
         if std::time::Instant::now() >= deadline {
             log::error!(
                 "gpui-main: timed out waiting for the render thread to release the surface"

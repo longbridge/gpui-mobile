@@ -64,10 +64,12 @@ use gpui_wgpu::GpuContext;
 
 // ── stub: clipboard ───────────────────────────────────────────────────────────
 
-/// Android clipboard (thin wrapper over `ClipboardManager` via JNI).
+/// Android clipboard.
 ///
-/// A real implementation would call into Java via `jni-rs`; for now we use
-/// an in-process string store so the rest of the platform compiles.
+/// With the `clipboard` feature this goes through the system `ClipboardManager`
+/// (`dev.gpui.mobile.GpuiClipboard`), so text copied in GPUI can be pasted in other
+/// apps and vice versa. Without the feature, or when the JNI call fails (the host did
+/// not package `GpuiClipboard.java`), it falls back to an in-process string store.
 #[derive(Default)]
 pub struct AndroidClipboard {
     contents: Option<String>,
@@ -75,10 +77,19 @@ pub struct AndroidClipboard {
 
 impl AndroidClipboard {
     pub fn read(&self) -> Option<String> {
+        #[cfg(feature = "clipboard")]
+        match crate::packages::clipboard::get_text() {
+            Ok(text) => return text,
+            Err(err) => log::warn!("system clipboard read failed, using local copy: {err}"),
+        }
         self.contents.clone()
     }
 
     pub fn write(&mut self, text: String) {
+        #[cfg(feature = "clipboard")]
+        if let Err(err) = crate::packages::clipboard::set_text(&text) {
+            log::warn!("system clipboard write failed, keeping local copy: {err}");
+        }
         self.contents = Some(text);
     }
 
