@@ -152,6 +152,68 @@ type Launch = Box<dyn FnOnce(&mut App) + Send>;
 /// with the platform primed to hand GPUI that host's surface.
 type OpenWindow = Arc<dyn Fn(HostId, &mut App) + Send + Sync>;
 
+/// Which backend a fresh GPU context is built on. See [`set_gpu_backend`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuBackend {
+    /// Vulkan first, GL if Vulkan cannot build our pipelines.
+    Auto,
+    /// Straight to GL, skipping the Vulkan attempt.
+    Gl,
+}
+
+/// How building the shared GPU context turned out. See [`on_gpu_outcome`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuOutcome {
+    Vulkan,
+    Gl,
+    /// Vulkan was tried and could not build our pipelines; now on GL.
+    GlAfterVulkanFailed,
+    /// A host's window could not be opened (or re-attached): it gets nothing on screen.
+    Failed,
+}
+
+static GPU_BACKEND_GL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+type GpuOutcomeCallback = Arc<dyn Fn(GpuOutcome) + Send + Sync>;
+static GPU_OUTCOME: Mutex<Option<GpuOutcomeCallback>> = Mutex::new(None);
+
+/// Pick the backend for the next fresh GPU context. Call before the first surface.
+///
+/// Which backend works is a property of the device's driver, so a host that has
+/// already seen [`GpuOutcome::GlAfterVulkanFailed`] can remember it and pass
+/// [`GpuBackend::Gl`] on later launches instead of failing on Vulkan every time.
+pub fn set_gpu_backend(backend: GpuBackend) {
+    GPU_BACKEND_GL.store(backend == GpuBackend::Gl, Ordering::SeqCst);
+}
+
+pub(crate) fn gpu_backend() -> GpuBackend {
+    if GPU_BACKEND_GL.load(Ordering::SeqCst) {
+        GpuBackend::Gl
+    } else {
+        GpuBackend::Auto
+    }
+}
+
+/// Called on the render thread once per fresh GPU context, and with
+/// [`GpuOutcome::Failed`] whenever a host's window cannot be opened, or cannot be
+/// re-attached when the host comes back (once per host). The outcome is about
+/// the device, not a host; on `Failed` the host being opened is the one whose
+/// Activity called `set_host_activity` last.
+pub fn on_gpu_outcome<F>(callback: F)
+where
+    F: Fn(GpuOutcome) + Send + Sync + 'static,
+{
+    *GPU_OUTCOME.lock().expect("poisoned") = Some(Arc::new(callback));
+}
+
+pub(crate) fn report_gpu_outcome(outcome: GpuOutcome) {
+    log::info!("gpui-main: GPU outcome: {outcome:?}");
+    let callback = GPU_OUTCOME.lock().expect("poisoned").clone();
+    if let Some(callback) = callback {
+        callback(outcome);
+    }
+}
+
 /// Registered by [`on_open_window`].
 static OPEN_WINDOW: Mutex<Option<OpenWindow>> = Mutex::new(None);
 /// Applied to the `Application` before `run_embedded`, so a host can register things
@@ -175,6 +237,11 @@ struct HostApp {
     /// so at most one is attached at a time — which makes it the only sensible target
     /// for input and the only window worth drawing.
     attached: Option<HostId>,
+    /// Hosts whose window could not be opened or re-attached. Reported once as
+    /// [`GpuOutcome::Failed`]; the host swaps that page for another UI, so its later
+    /// surfaces (`surfaceChanged` follows `surfaceCreated`) are ignored rather than
+    /// failing — and reporting — all over again.
+    failed: std::collections::HashSet<HostId>,
 }
 
 fn post(command: Command) {
@@ -247,6 +314,7 @@ fn render_thread(launch: Launch) {
         handle: None,
         windows: std::collections::HashMap::new(),
         attached: None,
+        failed: std::collections::HashSet::new(),
     };
 
     loop {
@@ -276,6 +344,7 @@ fn render_thread(launch: Launch) {
                     SURFACE_RELEASED.store(true, Ordering::SeqCst);
                 }
                 Command::HostDestroyed { host } => {
+                    app.failed.remove(&host);
                     if let Some(win) = app.windows.remove(&host) {
                         win.term_window();
                         platform.close_window(win.id());
@@ -363,6 +432,11 @@ fn on_surface_created(
 ) {
     SURFACE_RELEASED.store(false, Ordering::SeqCst);
 
+    if app.failed.contains(&host) {
+        log::info!("gpui-main: host {host} already failed; ignoring its surface");
+        return;
+    }
+
     let incoming = window.ptr().as_ptr();
     if app.attached == Some(host) && CURRENT_SURFACE.load(Ordering::SeqCst) == incoming {
         // `surfaceChanged` for a surface we are already rendering into: the size may
@@ -387,7 +461,14 @@ fn on_surface_created(
                 // considers the same field focused; ask the new Activity for the IME.
                 super::jni::restore_keyboard();
             }
-            Err(err) => log::error!("gpui-main: init_window failed: {err:#}"),
+            Err(err) => {
+                // Without this the page stays black: the window keeps its old,
+                // now-unusable surface and nothing tells the host to switch away.
+                log::error!("gpui-main: init_window failed: {err:#}");
+                app.failed.insert(host);
+                report_gpu_outcome(GpuOutcome::Failed);
+                return;
+            }
         }
         existing.set_active(true);
         return;
@@ -398,6 +479,8 @@ fn on_surface_created(
         Ok(win) => win,
         Err(err) => {
             log::error!("gpui-main: open_window failed: {err:#}");
+            app.failed.insert(host);
+            report_gpu_outcome(GpuOutcome::Failed);
             return;
         }
     };

@@ -53,7 +53,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
-use super::{AndroidKeyEvent, Bounds, DevicePixels, Pixels, Point, Size, TouchPoint};
+use super::{host, AndroidKeyEvent, Bounds, DevicePixels, Pixels, Point, Size, TouchPoint};
 
 /// Lightweight, owned window handle for wgpu surface creation.
 /// Stores the raw ANativeWindow pointer and implements the traits
@@ -532,7 +532,12 @@ impl AndroidWindow {
             let config = WgpuSurfaceConfig {
                 size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
                 transparent,
-                preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+                // `None` keeps the mode negotiated when the renderer was created.
+                // `replace_surface` applies a preferred mode without checking the
+                // surface caps (unlike `WgpuRenderer::new`), and GL only offers
+                // `Fifo`: asking for `Mailbox` here leaves the surface unconfigured
+                // and the next frame panics in `get_current_texture_view`.
+                preferred_present_mode: None,
             };
             let instance = state
                 .gpu_context
@@ -1184,13 +1189,160 @@ impl AndroidWindow {
     ) -> Result<WgpuRenderer> {
         let raw = Self::raw_window(native_window);
 
-        let config = WgpuSurfaceConfig {
+        let config = || WgpuSurfaceConfig {
             size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
             transparent,
             preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
         };
 
-        WgpuRenderer::new(gpu_context, &raw, config, None)
+        if gpu_context.borrow().is_some() {
+            // The shared context already works for this process; just add a surface.
+            return WgpuRenderer::new(gpu_context, &raw, config(), None);
+        }
+
+        // A fresh context. wgpu picks an adapter by creating a device and configuring
+        // a surface, which says nothing about whether the driver can build our
+        // pipelines — and on Android it often cannot: an Adreno 512 (Android 8.1)
+        // loses the Vulkan device while compiling our shaders, and a GL without
+        // unaligned buffer bindings rejects `path_rasterization`. So every attempt
+        // builds the renderer inside an error scope and only counts if nothing failed.
+        if host::gpu_backend() == host::GpuBackend::Gl {
+            // The host remembers this device cannot run our pipelines on Vulkan.
+            let renderer =
+                Self::try_fresh_renderer(&gpu_context, &raw, config(), wgpu::Backends::GL)?;
+            host::report_gpu_outcome(host::GpuOutcome::Gl);
+            return Ok(renderer);
+        }
+
+        match Self::try_fresh_renderer(
+            &gpu_context,
+            &raw,
+            config(),
+            wgpu::Backends::VULKAN | wgpu::Backends::GL,
+        ) {
+            Ok(renderer) => {
+                // Report what wgpu actually picked: devices without Vulkan get GL here.
+                let on_vulkan = gpu_context.borrow().as_ref().is_some_and(|ctx| {
+                    matches!(
+                        ctx.backend(),
+                        gpui_wgpu::WgpuBackend::Native(wgpu::Backend::Vulkan)
+                    )
+                });
+                host::report_gpu_outcome(if on_vulkan {
+                    host::GpuOutcome::Vulkan
+                } else {
+                    host::GpuOutcome::Gl
+                });
+                Ok(renderer)
+            }
+            Err(FreshRendererError {
+                backend: wgpu::Backend::Vulkan,
+                error,
+            }) => {
+                log::warn!(
+                    "AndroidWindow: Vulkan cannot build our pipelines ({error:#}) — retrying on GL"
+                );
+                let renderer =
+                    Self::try_fresh_renderer(&gpu_context, &raw, config(), wgpu::Backends::GL)?;
+                host::report_gpu_outcome(host::GpuOutcome::GlAfterVulkanFailed);
+                Ok(renderer)
+            }
+            // wgpu already chose GL (no usable Vulkan): nothing else to try.
+            Err(err) => Err(err.error),
+        }
+    }
+
+    /// Build a fresh shared context on `backends` and a renderer on it, counting it
+    /// only if nothing failed along the way. On failure the context is dropped again
+    /// — releasing its surface, so another backend can attach to the same window.
+    ///
+    /// The error scope matters: `WgpuRenderer::new` builds its pipelines before it
+    /// installs its own error handler, so a rejected pipeline would otherwise reach
+    /// wgpu's default handler, which panics the render thread.
+    fn try_fresh_renderer(
+        gpu_context: &GpuContext,
+        raw: &RawAndroidWindow,
+        config: WgpuSurfaceConfig,
+        backends: wgpu::Backends,
+    ) -> std::result::Result<WgpuRenderer, FreshRendererError> {
+        let context = Self::create_context(raw, backends).map_err(|error| FreshRendererError {
+            backend: wgpu::Backend::Noop,
+            error,
+        })?;
+        let backend = match context.backend() {
+            gpui_wgpu::WgpuBackend::Native(backend) => backend,
+            _ => wgpu::Backend::Gl,
+        };
+        let device = Arc::clone(&context.device);
+        *gpu_context.borrow_mut() = Some(context);
+
+        let scopes = [
+            device.push_error_scope(wgpu::ErrorFilter::Validation),
+            device.push_error_scope(wgpu::ErrorFilter::OutOfMemory),
+            device.push_error_scope(wgpu::ErrorFilter::Internal),
+        ];
+        let renderer = WgpuRenderer::new(Rc::clone(gpu_context), raw, config, None);
+        let mut scope_error = None;
+        for scope in scopes.into_iter().rev() {
+            if let Some(error) = gpui::block_on(scope.pop()) {
+                scope_error.get_or_insert(error);
+            }
+        }
+        let lost = gpu_context
+            .borrow()
+            .as_ref()
+            .is_some_and(|ctx| ctx.device_lost());
+
+        let failure = match (renderer, scope_error, lost) {
+            (Ok(renderer), None, false) => return Ok(renderer),
+            (Err(error), _, _) => error,
+            (Ok(_), Some(error), _) => anyhow::anyhow!("{error}"),
+            (Ok(_), None, true) => anyhow::anyhow!("GPU device lost while building pipelines"),
+        };
+        // The failed renderer is already dropped above; drop the context with it.
+        *gpu_context.borrow_mut() = None;
+        Err(FreshRendererError {
+            backend,
+            error: failure,
+        })
+    }
+
+    /// A `WgpuContext` restricted to `backends`, probed against `raw`.
+    fn create_context(
+        raw: &RawAndroidWindow,
+        backends: wgpu::Backends,
+    ) -> Result<gpui_wgpu::WgpuContext> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: Some(Box::new(raw.clone())),
+        });
+        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: None,
+            raw_window_handle: raw
+                .window_handle()
+                .map_err(|e| anyhow::anyhow!("window handle unavailable: {e}"))?
+                .as_raw(),
+        };
+        // SAFETY: the native window outlives this probe surface. Dropping it
+        // releases the window before the renderer creates its own surface.
+        let surface = unsafe { instance.create_surface_unsafe(target) }
+            .context("failed to create a probe surface")?;
+        gpui_wgpu::WgpuContext::new(instance, &surface, None)
+    }
+}
+
+/// Why [`AndroidWindow::try_fresh_renderer`] failed, and on which backend.
+struct FreshRendererError {
+    backend: wgpu::Backend,
+    error: anyhow::Error,
+}
+
+impl From<FreshRendererError> for anyhow::Error {
+    fn from(err: FreshRendererError) -> Self {
+        err.error
     }
 }
 
