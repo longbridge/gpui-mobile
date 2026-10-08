@@ -27,7 +27,14 @@
 //!    [`super::jni::set_host_activity`] from a JNI entry point, then [`start`] (a no-op
 //!    after the first call).
 //! 2. From `SurfaceHolder.Callback`: [`surface_created`] in both `surfaceCreated` and
-//!    `surfaceChanged`, [`surface_destroyed`] in `surfaceDestroyed`.
+//!    `surfaceChanged`, [`surface_destroyed`] in `surfaceDestroyed`, and
+//!    [`host_destroyed`] from `onDestroy` when the Activity is finishing.
+//!
+//! Each of those takes a [`HostId`] the host assigns per Activity instance. Every
+//! distinct id gets a GPUI window of its own — built by the [`on_open_window`]
+//! callback — so a host may stack several AI screens and each returns to its own
+//! panel. Reuse the same id across an Activity's configuration changes; pick a fresh
+//! one for a new instance.
 //! 3. From `onResume` / `onPause`: [`resumed`] / [`paused`].
 //! 4. From `onTouchEvent`, `dispatchKeyEvent` and the `InputConnection`:
 //!    [`motion_event`], [`key`], [`ime_event`].
@@ -92,12 +99,23 @@ unsafe impl Send for LooperPtr {}
 
 enum Command {
     SurfaceCreated {
+        host: HostId,
         window: NativeWindow,
         scale: f32,
     },
-    SurfaceDestroyed,
-    Resumed,
-    Paused,
+    SurfaceDestroyed {
+        host: HostId,
+    },
+    /// The Activity is gone for good — drop its window and everything it holds.
+    HostDestroyed {
+        host: HostId,
+    },
+    Resumed {
+        host: HostId,
+    },
+    Paused {
+        host: HostId,
+    },
     /// Input arrives on the Java UI thread but GPUI may only be touched from the
     /// render thread, so both go through the queue like everything else.
     Touch(TouchPoint),
@@ -121,7 +139,21 @@ pub struct Pointer {
     pub y: f32,
 }
 
+/// Identifies one host surface owner — an Activity instance, typically.
+///
+/// The host picks the value and must keep it stable across the Activity's
+/// `surfaceDestroyed` / `surfaceCreated` cycles: that is what tells us "this is the
+/// same Activity coming back" rather than a new one, and so which window to re-attach.
+pub type HostId = u64;
+
 type Launch = Box<dyn FnOnce(&mut App) + Send>;
+
+/// Builds the UI for one host window. Called once per [`HostId`], on the render thread,
+/// with the platform primed to hand GPUI that host's surface.
+type OpenWindow = Arc<dyn Fn(HostId, &mut App) + Send + Sync>;
+
+/// Registered by [`on_open_window`].
+static OPEN_WINDOW: Mutex<Option<OpenWindow>> = Mutex::new(None);
 /// Applied to the `Application` before `run_embedded`, so a host can register things
 /// that must exist before the first frame — an asset source, most importantly.
 type Configure = Box<dyn FnOnce(Application) -> Application + Send>;
@@ -136,6 +168,13 @@ struct HostApp {
     /// Keeps the `App` alive: `Platform::run` returns immediately on this path, so
     /// nothing else holds the `Rc<AppCell>`.
     handle: Option<ApplicationHandle>,
+    /// One window per host, kept across that host's surface teardowns so a returning
+    /// Activity finds its own panel rather than whatever ran last.
+    windows: std::collections::HashMap<HostId, Arc<super::window::AndroidWindow>>,
+    /// The host whose surface is live. Android destroys a covered Activity's surface,
+    /// so at most one is attached at a time — which makes it the only sensible target
+    /// for input and the only window worth drawing.
+    attached: Option<HostId>,
 }
 
 fn post(command: Command) {
@@ -206,6 +245,8 @@ fn render_thread(launch: Launch) {
     let mut app = HostApp {
         launch: Some(launch),
         handle: None,
+        windows: std::collections::HashMap::new(),
+        attached: None,
     };
 
     loop {
@@ -216,35 +257,60 @@ fn render_thread(launch: Launch) {
         let commands: Vec<Command> = COMMANDS.lock().expect("poisoned").drain(..).collect();
         for command in commands {
             match command {
-                Command::SurfaceCreated { window, scale } => {
-                    on_surface_created(&platform, window, scale, &mut app);
+                Command::SurfaceCreated {
+                    host,
+                    window,
+                    scale,
+                } => {
+                    on_surface_created(&platform, host, window, scale, &mut app);
                 }
-                Command::SurfaceDestroyed => {
-                    if let Some(win) = platform.primary_window() {
+                Command::SurfaceDestroyed { host } => {
+                    if let Some(win) = app.windows.get(&host) {
                         // Keeps the renderer (and its atlas) alive; only the surface goes.
                         win.term_window();
                     }
-                    CURRENT_SURFACE.store(std::ptr::null_mut(), Ordering::SeqCst);
+                    if app.attached == Some(host) {
+                        app.attached = None;
+                        CURRENT_SURFACE.store(std::ptr::null_mut(), Ordering::SeqCst);
+                    }
                     SURFACE_RELEASED.store(true, Ordering::SeqCst);
                 }
-                Command::Resumed => {
+                Command::HostDestroyed { host } => {
+                    if let Some(win) = app.windows.remove(&host) {
+                        win.term_window();
+                        platform.close_window(win.id());
+                        log::info!(
+                            "gpui-main: host {host} closed, {} window(s) left",
+                            app.windows.len()
+                        );
+                    }
+                    if app.attached == Some(host) {
+                        app.attached = None;
+                        CURRENT_SURFACE.store(std::ptr::null_mut(), Ordering::SeqCst);
+                    }
+                }
+                Command::Resumed { host } => {
                     platform.did_become_active();
-                    if let Some(win) = platform.primary_window() {
+                    // Only this host's window. Stacking two Activities interleaves as
+                    // `A.onPause → B.onResume → A.onStop`, so a global "resume" would
+                    // wake A back up right after it paused, purely because B's surface
+                    // has not arrived yet to take over as attached.
+                    if let Some(win) = app.windows.get(&host) {
                         win.set_active(true);
                     }
                 }
-                Command::Paused => {
+                Command::Paused { host } => {
                     platform.did_enter_background();
-                    if let Some(win) = platform.primary_window() {
+                    if let Some(win) = app.windows.get(&host) {
                         win.set_active(false);
                     }
                 }
-                Command::Touch(point) => match platform.primary_window() {
+                Command::Touch(point) => match attached_window(&app) {
                     Some(win) => win.handle_touch(point),
-                    None => log::warn!("gpui-main: touch dropped — no window"),
+                    None => log::warn!("gpui-main: touch dropped — no attached window"),
                 },
                 Command::Key(event) => {
-                    if let Some(win) = platform.primary_window() {
+                    if let Some(win) = attached_window(&app) {
                         win.handle_key_event(event);
                     }
                 }
@@ -258,7 +324,7 @@ fn render_thread(launch: Launch) {
             // callback turns it into a forced render.
             super::frame_source::schedule_frame();
         }
-        let window = platform.primary_window();
+        let window = attached_window(&app);
         let can_draw = window.as_ref().is_some_and(|win| win.is_active());
         if can_draw && super::frame_source::take_frame() {
             if let Some(win) = &window {
@@ -282,8 +348,15 @@ fn render_thread(launch: Launch) {
     }
 }
 
+/// The window the live surface belongs to, or `None` while nothing is attached.
+fn attached_window(app: &HostApp) -> Option<Arc<super::window::AndroidWindow>> {
+    app.attached
+        .and_then(|host| app.windows.get(&host).cloned())
+}
+
 fn on_surface_created(
     platform: &Arc<AndroidPlatform>,
+    host: HostId,
     window: NativeWindow,
     scale: f32,
     app: &mut HostApp,
@@ -291,23 +364,25 @@ fn on_surface_created(
     SURFACE_RELEASED.store(false, Ordering::SeqCst);
 
     let incoming = window.ptr().as_ptr();
-    if CURRENT_SURFACE.load(Ordering::SeqCst) == incoming {
+    if app.attached == Some(host) && CURRENT_SURFACE.load(Ordering::SeqCst) == incoming {
         // `surfaceChanged` for a surface we are already rendering into: the size may
         // have changed, but the Vulkan surface must not be rebuilt.
-        if let Some(existing) = platform.primary_window() {
+        if let Some(existing) = app.windows.get(&host) {
             existing.handle_resize();
         }
         return;
     }
 
-    if let Some(existing) = platform.primary_window() {
-        // Recreated Activity (or a resumed one): re-attach the new surface to the
-        // renderer we already have. GPUI's scene cache and the texture atlas survive.
+    if let Some(existing) = app.windows.get(&host).cloned() {
+        // This host has been here before — a recreated or resumed Activity. Re-attach
+        // its own window, so it comes back to the panel it left rather than whichever
+        // one happened to run last.
         let gpu = platform.gpu_context();
         match existing.init_window(window, gpu) {
             Ok(()) => {
                 CURRENT_SURFACE.store(incoming, Ordering::SeqCst);
-                log::info!("gpui-main: surface re-attached to existing window");
+                app.attached = Some(host);
+                log::info!("gpui-main: host {host} re-attached to its window");
                 // The Java `InputProxy` died with the old Activity while GPUI still
                 // considers the same field focused; ask the new Activity for the IME.
                 super::jni::restore_keyboard();
@@ -318,33 +393,86 @@ fn on_surface_created(
         return;
     }
 
-    // First surface: create the window, then let the host build its UI.
-    match platform.open_window(window, scale, false) {
-        Ok(win) => {
-            CURRENT_SURFACE.store(incoming, Ordering::SeqCst);
-            win.set_active(true);
-            log::info!("gpui-main: first window opened");
-            if let Some(launch) = app.launch.take() {
-                // Without an `AndroidApp` to drive, `AndroidPlatform::run` invokes the
-                // callback immediately and returns — the shape `run_embedded` expects.
-                // The handle is what keeps the `App` alive afterwards.
-                let mut application =
-                    Application::with_platform(SharedPlatform::new(Arc::clone(platform)).into_rc());
-                if let Some(configure) = CONFIGURE.lock().expect("poisoned").take() {
-                    application = configure(application);
-                }
-                app.handle = Some(application.run_embedded(launch));
-            }
+    // A host we have not seen: it gets a window of its own.
+    let win = match platform.open_window(window, scale, false) {
+        Ok(win) => win,
+        Err(err) => {
+            log::error!("gpui-main: open_window failed: {err:#}");
+            return;
         }
-        Err(err) => log::error!("gpui-main: open_window failed: {err:#}"),
+    };
+    CURRENT_SURFACE.store(incoming, Ordering::SeqCst);
+    win.set_active(true);
+    app.windows.insert(host, Arc::clone(&win));
+    app.attached = Some(host);
+
+    if app.handle.is_none() {
+        // Without an `AndroidApp` to drive, `AndroidPlatform::run` invokes the
+        // callback immediately and returns — the shape `run_embedded` expects.
+        // The handle is what keeps the `App` alive afterwards.
+        let Some(launch) = app.launch.take() else {
+            log::error!("gpui-main: no launch closure for the first window");
+            return;
+        };
+        let mut application =
+            Application::with_platform(SharedPlatform::new(Arc::clone(platform)).into_rc());
+        if let Some(configure) = CONFIGURE.lock().expect("poisoned").take() {
+            application = configure(application);
+        }
+        app.handle = Some(application.run_embedded(launch));
+        log::info!("gpui-main: GPUI app built for host {host}");
     }
+
+    // Name the window before asking GPUI to open one: `Platform::open_window` has no
+    // argument saying *which* surface, and would otherwise answer with `primary` —
+    // every host after the first would then render into the first host's surface.
+    platform.set_pending_window(Arc::clone(&win));
+    let open = OPEN_WINDOW.lock().expect("poisoned").clone();
+    match (open, app.handle.as_ref()) {
+        (Some(open), Some(handle)) => {
+            handle.update(|cx| open(host, cx));
+            log::info!(
+                "gpui-main: window opened for host {host} ({} total)",
+                app.windows.len()
+            );
+        }
+        _ => log::warn!("gpui-main: no on_open_window callback; host {host} stays blank"),
+    }
+    // Not consumed (no callback, or it opened nothing) — do not leave it for the next
+    // `cx.open_window`, whoever that turns out to be.
+    platform.take_pending_window();
 }
 
 /// Hand a `Surface` to the render thread. Call from both `surfaceCreated` and
 /// `surfaceChanged`; a repeat of the surface already held is treated as a resize.
-pub fn surface_created(window: NativeWindow, scale: f32) {
+pub fn surface_created(host: HostId, window: NativeWindow, scale: f32) {
     SCALE_BITS.store(scale.to_bits(), Ordering::Relaxed);
-    post(Command::SurfaceCreated { window, scale });
+    post(Command::SurfaceCreated {
+        host,
+        window,
+        scale,
+    });
+}
+
+/// Build the UI for a host window. Called once per [`HostId`] on the render thread,
+/// with the platform primed so the `cx.open_window` inside lands on that host's
+/// surface — see [`AndroidPlatform::set_pending_window`].
+///
+/// Register before the first [`surface_created`]; without it a host's surface opens a
+/// native window but GPUI never draws into it.
+pub fn on_open_window<F>(callback: F)
+where
+    F: Fn(HostId, &mut App) + Send + Sync + 'static,
+{
+    *OPEN_WINDOW.lock().expect("poisoned") = Some(Arc::new(callback));
+}
+
+/// Drop everything a host owns: its GPUI window, and with it that host's panel.
+///
+/// Call from `Activity.onDestroy` when the Activity is finishing for good — not on a
+/// configuration change, where the same [`HostId`] is expected back.
+pub fn host_destroyed(host: HostId) {
+    post(Command::HostDestroyed { host });
 }
 
 /// Take the surface back and **block until the render thread has let go of it**.
@@ -352,9 +480,14 @@ pub fn surface_created(window: NativeWindow, scale: f32) {
 /// Call this from `SurfaceHolder.Callback.surfaceDestroyed` before returning to the
 /// framework, otherwise the `Surface` is torn down underneath a thread that may be
 /// inside `ANativeWindow_lock`.
-pub fn surface_destroyed() {
-    post(Command::SurfaceDestroyed);
+pub fn surface_destroyed(host: HostId) {
+    post(Command::SurfaceDestroyed { host });
 
+    // One global flag serves every host because `SurfaceHolder.Callback` fires on the
+    // Java UI thread: while this blocks, no other Activity can reach `surface_created`
+    // to clear it. Waiting per host would mean polling a map from a blocked UI thread
+    // for no gain.
+    //
     // Bounded wait: a stuck render thread must not turn into an ANR. 2 s is far below
     // the 5 s input-dispatch timeout while being far above a worst-case frame.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -447,10 +580,10 @@ pub fn ime_event(session: u64, kind: i32, text: String, start: usize, end: usize
     });
 }
 
-pub fn resumed() {
-    post(Command::Resumed);
+pub fn resumed(host: HostId) {
+    post(Command::Resumed { host });
 }
 
-pub fn paused() {
-    post(Command::Paused);
+pub fn paused(host: HostId) {
+    post(Command::Paused { host });
 }
