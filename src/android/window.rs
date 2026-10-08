@@ -138,12 +138,44 @@ fn load_set_frame_rate_with_change_strategy() -> Option<SetFrameRateWithChangeSt
     })
 }
 
+/// The device's Android API level.
+///
+/// Deliberately *not* `ndk_sys::android_get_device_api_level()`: that symbol only entered
+/// libc in Android 10 (API 29), and Rust has no equivalent of the NDK C headers'
+/// `__INTRODUCED_IN` guards, so building against a lower platform still emits a **strong**
+/// undefined reference instead of falling back to the inline implementation. The result is
+/// that the whole `.so` fails to `dlopen` on anything below API 29 (reproduced on an
+/// OPPO R11s running Android 8.1) — the very devices the downgrade path below exists for.
+///
+/// Reading `ro.build.version.sdk` is available since API 1 and needs no new symbol.
+fn device_api_level() -> i32 {
+    static LEVEL: OnceLock<i32> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        let mut value = [0u8; libc::PROP_VALUE_MAX as usize];
+        let len = unsafe {
+            libc::__system_property_get(
+                b"ro.build.version.sdk\0".as_ptr().cast(),
+                value.as_mut_ptr().cast(),
+            )
+        };
+        if len <= 0 {
+            // Unreadable: report the lowest level so we skip the high-refresh request
+            // rather than wrongly assume support.
+            return 0;
+        }
+        std::str::from_utf8(&value[..len as usize])
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Request 120 Hz refresh rate from the native window when the platform exposes the API.
 ///
 /// The NDK entry points are resolved with `dlsym` so this library still loads
 /// on pre-API-30/31 devices where the symbols do not exist.
 fn request_high_frame_rate(window: &NativeWindow) {
-    let api_level = unsafe { ndk_sys::android_get_device_api_level() };
+    let api_level = device_api_level();
     let native_window = window.ptr().as_ptr();
 
     let status = if api_level >= 31 {
