@@ -55,6 +55,40 @@ use std::sync::{Arc, OnceLock};
 
 use super::{host, AndroidKeyEvent, Bounds, DevicePixels, Pixels, Point, Size, TouchPoint};
 
+/// A touch that ends within this distance of where it started is a tap, not a drag.
+fn is_tap_distance(start: gpui::Point<gpui::Pixels>, end: gpui::Point<gpui::Pixels>) -> bool {
+    const SLOP: f32 = 10.;
+    let (dx, dy) = (f32::from(end.x - start.x), f32::from(end.y - start.y));
+    dx * dx + dy * dy <= SLOP * SLOP
+}
+
+/// Whether `position` is on the row of the focused text input, judged by its caret.
+///
+/// The input handler exposes text geometry, not the field's frame; the caret's line is
+/// a close enough stand-in for a single-line field, and stops a tap anywhere else on
+/// screen from popping the keyboard back up.
+fn tap_hits_focused_input(
+    slot: &Rc<RefCell<Option<PlatformInputHandler>>>,
+    position: gpui::Point<gpui::Pixels>,
+) -> bool {
+    // No RefCell borrow may span the handler's GPUI update; same pattern as `text_input`.
+    let Some(mut handler) = slot.borrow_mut().take() else {
+        return false;
+    };
+    let caret = handler
+        .selected_text_range(false)
+        .and_then(|selection| handler.bounds_for_range(selection.range));
+    let mut current = slot.borrow_mut();
+    if current.is_none() {
+        *current = Some(handler);
+    }
+    const ROW_SLOP: f32 = 16.;
+    caret.is_some_and(|caret| {
+        let y = f32::from(position.y);
+        y >= f32::from(caret.top()) - ROW_SLOP && y <= f32::from(caret.bottom()) + ROW_SLOP
+    })
+}
+
 /// Lightweight, owned window handle for wgpu surface creation.
 /// Stores the raw ANativeWindow pointer and implements the traits
 /// required by `WgpuRenderer::new` (`Clone + Debug + Send + Sync + 'static`).
@@ -1606,18 +1640,44 @@ impl PlatformWindow for AndroidPlatformWindow {
     fn on_input(&self, callback: Box<dyn FnMut(gpui::PlatformInput) -> DispatchEventResult>) {
         let input_handler = Rc::clone(&self.input_handler);
         let mut callback = callback;
-        let callback: Box<dyn FnMut(gpui::PlatformInput) -> DispatchEventResult> = Box::new(
-            move |event| {
-                if matches!(&event, gpui::PlatformInput::Touch(touch) if touch.phase == gpui::TouchPhase::Started)
-                {
-                    // Apply any last IME update to the old input before a tap can
-                    // change focus. A new native session rejects late IME callbacks.
-                    super::text_input::drain(&input_handler, &mut callback);
-                    super::text_input::finish_composition(&input_handler);
+        // Where the current single-finger touch started, to tell a tap from a drag.
+        let mut tap_start: Option<(gpui::TouchId, gpui::Point<gpui::Pixels>)> = None;
+        let callback: Box<dyn FnMut(gpui::PlatformInput) -> DispatchEventResult> =
+            Box::new(move |event| {
+                if let gpui::PlatformInput::Touch(touch) = &event {
+                    match touch.phase {
+                        gpui::TouchPhase::Started => {
+                            // Apply any last IME update to the old input before a tap can
+                            // change focus. A new native session rejects late IME callbacks.
+                            super::text_input::drain(&input_handler, &mut callback);
+                            super::text_input::finish_composition(&input_handler);
+                            tap_start = Some((touch.id, touch.position));
+                        }
+                        gpui::TouchPhase::Moved => {
+                            if tap_start.is_some_and(|(id, start)| {
+                                id == touch.id && !is_tap_distance(start, touch.position)
+                            }) {
+                                tap_start = None;
+                            }
+                        }
+                        gpui::TouchPhase::Ended => {
+                            // The user hid the keyboard with back while the field kept
+                            // focus (see `jni::keyboard_hidden_by_user`): tapping that
+                            // field again must bring the keyboard back, as on a native
+                            // EditText. Checked before GPUI handles the tap, against the
+                            // input that is focused now.
+                            if tap_start.take().is_some_and(|(id, _)| id == touch.id)
+                                && super::jni::keyboard_dismissed()
+                                && tap_hits_focused_input(&input_handler, touch.position)
+                            {
+                                super::jni::reshow_dismissed_keyboard();
+                            }
+                        }
+                        gpui::TouchPhase::Cancelled => tap_start = None,
+                    }
                 }
                 callback(event)
-            },
-        );
+            });
         // Bridge AndroidWindow touch/key callbacks → gpui::PlatformInput.
         //
         // PlatformWindow gives us Box<dyn FnMut(...)> (not Send).

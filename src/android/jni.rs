@@ -1291,6 +1291,35 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
 /// the IME back; see [`restore_keyboard`].
 static SHOWN_KEYBOARD: std::sync::Mutex<Option<crate::KeyboardType>> = std::sync::Mutex::new(None);
 
+/// The keyboard the user hid (back) while its text input kept focus.
+///
+/// GPUI asks for the keyboard only when a text input *gains* focus, and the platform
+/// cannot blur it, so after a back-press the field stays focused with no keyboard and
+/// tapping it again changes nothing. [`super::window`] uses this to bring the keyboard
+/// back when a tap lands on the focused field. Cleared by any explicit show or hide.
+static DISMISSED_KEYBOARD: std::sync::Mutex<Option<crate::KeyboardType>> =
+    std::sync::Mutex::new(None);
+
+/// IME event 5: the system already hid the keyboard; remember it for a tap to undo.
+pub(crate) fn keyboard_hidden_by_user() {
+    let shown = SHOWN_KEYBOARD.lock().expect("poisoned").take();
+    if shown.is_some() {
+        *DISMISSED_KEYBOARD.lock().expect("poisoned") = shown;
+    }
+}
+
+pub(crate) fn keyboard_dismissed() -> bool {
+    DISMISSED_KEYBOARD.lock().expect("poisoned").is_some()
+}
+
+/// Show the keyboard [`keyboard_hidden_by_user`] took away again.
+pub(crate) fn reshow_dismissed_keyboard() {
+    let dismissed = DISMISSED_KEYBOARD.lock().expect("poisoned").take();
+    if let Some(keyboard_type) = dismissed {
+        show_keyboard_android(keyboard_type);
+    }
+}
+
 /// Re-request the keyboard on the current Activity if one was showing.
 ///
 /// Called by [`super::host`] once a recreated Activity's surface is attached. A fresh
@@ -1309,6 +1338,7 @@ pub(crate) fn restore_keyboard() {
 /// supports composing text, commits and Unicode surrounding-text deletion.
 pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
     *SHOWN_KEYBOARD.lock().expect("poisoned") = Some(keyboard_type);
+    *DISMISSED_KEYBOARD.lock().expect("poisoned") = None;
     let kind = match keyboard_type {
         crate::KeyboardType::Default => 0,
         crate::KeyboardType::EmailAddress => 1,
@@ -1342,6 +1372,7 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
 /// Invalidates queued IME callbacks and clears the native composition buffer.
 pub fn hide_keyboard_android() {
     *SHOWN_KEYBOARD.lock().expect("poisoned") = None;
+    *DISMISSED_KEYBOARD.lock().expect("poisoned") = None;
     let session = super::text_input::new_session();
     let _ = with_env(|env| {
         let activity = activity(env)?;

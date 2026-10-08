@@ -46,6 +46,14 @@ pub(super) fn drain(
         if event.session != SESSION.load(Ordering::Acquire) {
             continue;
         }
+        if event.kind == 5 {
+            // The user hid the keyboard (back) but the input keeps focus: unlike 4 this
+            // is not an Escape, which would close whatever owns the field (a search
+            // overlay, with its query). See `jni::keyboard_hidden_by_user`.
+            finish_composition(slot);
+            super::jni::keyboard_hidden_by_user();
+            continue;
+        }
         if event.kind == 4 {
             finish_composition(slot);
             input(PlatformInput::KeyDown(KeyDownEvent {

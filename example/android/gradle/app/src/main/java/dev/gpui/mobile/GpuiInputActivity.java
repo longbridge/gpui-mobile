@@ -129,7 +129,7 @@ public class GpuiInputActivity extends NativeActivity {
 
         @Override public boolean onKeyPreIme(int code, KeyEvent event) {
             if (code == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_UP) {
-                nativeIme(session, 4, "", 0, 0);
+                nativeIme(session, 5, "", 0, 0);
             }
             return super.onKeyPreIme(code, event);
         }
