@@ -317,7 +317,45 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
     let mut slot = HOST_ACTIVITY.lock().expect("poisoned");
     slot.previous = slot.current.take();
     slot.current = Some(global);
+    drop(slot);
+    if HOST_APPLICATION.get().is_none() {
+        match application_context(env, activity) {
+            Ok(context) => {
+                let _ = HOST_APPLICATION.set(context);
+            }
+            Err(err) => {
+                if env.exception_check() {
+                    env.exception_clear();
+                }
+                log::warn!("set_host_activity: no application context: {err}");
+            }
+        }
+    }
     Ok(())
+}
+
+/// The application context, taken from the first host Activity and kept for the
+/// life of the process. Its configuration follows system-wide changes such as night
+/// mode, whichever Activity is in front and whatever it handles itself.
+static HOST_APPLICATION: OnceLock<jni::refs::Global<JObject<'static>>> = OnceLock::new();
+
+fn application_context(
+    env: &mut jni::Env<'_>,
+    activity: &JObject<'_>,
+) -> Result<jni::refs::Global<JObject<'static>>, String> {
+    let context = env
+        .call_method(
+            activity,
+            jni::jni_str!("getApplicationContext"),
+            jni::jni_sig!("()Landroid/content/Context;"),
+            &[],
+        )
+        .and_then(|value| value.l())
+        .e()?;
+    if context.is_null() {
+        return Err("getApplicationContext returned null".into());
+    }
+    env.new_global_ref(&context).e()
 }
 
 /// Public accessor for the JavaVM pointer.
@@ -401,23 +439,71 @@ const AMOTION_EVENT_ACTION_UP: u32 = 1;
 const AMOTION_EVENT_ACTION_MOVE: u32 = 2;
 const AMOTION_EVENT_ACTION_CANCEL: u32 = 3;
 
-// ── night mode query via NDK Configuration ───────────────────────────────────
+// ── night mode query ─────────────────────────────────────────────────────────
 
-/// Query the current night mode using the NDK Configuration API.
+/// Query the current night mode.
 ///
 /// Returns `true` if the system is in dark mode.
 pub fn query_night_mode_via_jni() -> bool {
-    let app = match android_app() {
-        Some(app) => app,
-        None => return false,
+    let is_dark = if let Some(app) = android_app() {
+        // Build an ndk::configuration::Configuration from the app's asset manager.
+        let config = ndk::configuration::Configuration::from_asset_manager(&app.asset_manager());
+        config.ui_mode_night() == ndk::configuration::UiModeNight::Yes
+    } else {
+        // No AndroidApp on the host-driven path: ask the application's Resources.
+        // An Activity that handles `uiMode` itself keeps a stale configuration in its
+        // AssetManager.
+        host_ui_mode().is_ok_and(|ui_mode| ui_mode & UI_MODE_NIGHT_MASK == UI_MODE_NIGHT_YES)
     };
 
-    // Build an ndk::configuration::Configuration from the app's asset manager.
-    let config = ndk::configuration::Configuration::from_asset_manager(&app.asset_manager());
-    let is_dark = config.ui_mode_night() == ndk::configuration::UiModeNight::Yes;
-
-    log::debug!("query_night_mode (ndk): is_dark={}", is_dark);
+    log::debug!("query_night_mode: is_dark={}", is_dark);
     is_dark
+}
+
+/// `Configuration.UI_MODE_NIGHT_MASK` / `UI_MODE_NIGHT_YES`.
+const UI_MODE_NIGHT_MASK: i32 = 0x30;
+const UI_MODE_NIGHT_YES: i32 = 0x20;
+
+/// `getResources().getConfiguration().uiMode` of the application context.
+fn host_ui_mode() -> Result<i32, String> {
+    let context = HOST_APPLICATION
+        .get()
+        .ok_or("set_host_activity has not been called")?;
+    with_env(|env| {
+        let result = (|| {
+            let resources = env
+                .call_method(
+                    context,
+                    jni::jni_str!("getResources"),
+                    jni::jni_sig!("()Landroid/content/res/Resources;"),
+                    &[],
+                )?
+                .l()?;
+            let config = env
+                .call_method(
+                    &resources,
+                    jni::jni_str!("getConfiguration"),
+                    jni::jni_sig!("()Landroid/content/res/Configuration;"),
+                    &[],
+                )?
+                .l()?;
+            env.get_field(&config, jni::jni_str!("uiMode"), jni::jni_sig!("I"))?
+                .i()
+        })();
+        if result.is_err() {
+            env.exception_clear();
+        }
+        result.e()
+    })
+}
+
+/// Apply the system night mode to a window.
+pub(crate) fn sync_appearance(window: &crate::android::window::AndroidWindow) {
+    window.set_appearance(if query_night_mode_via_jni() {
+        crate::android::window::WindowAppearance::Dark
+    } else {
+        crate::android::window::WindowAppearance::Light
+    });
 }
 
 // ── input event processing ────────────────────────────────────────────────────
@@ -775,14 +861,8 @@ pub fn run_event_loop(app: &AndroidApp) {
             log::debug!("deferred: ConfigChanged");
             if let Some(platform) = PLATFORM.get() {
                 platform.notify_keyboard_layout_change();
-                let is_dark = query_night_mode_via_jni();
                 if let Some(win) = platform.primary_window() {
-                    let appearance = if is_dark {
-                        crate::android::window::WindowAppearance::Dark
-                    } else {
-                        crate::android::window::WindowAppearance::Light
-                    };
-                    win.set_appearance(appearance);
+                    sync_appearance(&win);
                 }
             }
         }

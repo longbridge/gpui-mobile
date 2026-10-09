@@ -1132,7 +1132,11 @@ impl Platform for AndroidPlatform {
     }
 
     fn window_appearance(&self) -> WindowAppearance {
-        WindowAppearance::Dark
+        if crate::android::jni::query_night_mode_via_jni() {
+            WindowAppearance::Dark
+        } else {
+            WindowAppearance::Light
+        }
     }
 
     fn open_url(&self, url: &str) {
