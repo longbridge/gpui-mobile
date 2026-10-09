@@ -317,6 +317,8 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
     let mut slot = HOST_ACTIVITY.lock().expect("poisoned");
     slot.previous = slot.current.take();
     slot.current = Some(global);
+    drop(slot);
+    super::accessibility::activity_changed();
     Ok(())
 }
 
@@ -487,6 +489,18 @@ fn process_input_events(app: &AndroidApp) {
                                     false
                                 }
                             };
+
+                            // GPUI does not use hover on mobile. With a screen reader on,
+                            // touch exploration arrives as hover events, which the
+                            // accessibility delegate on the decor view has to see.
+                            if matches!(
+                                action,
+                                MotionAction::HoverEnter
+                                    | MotionAction::HoverMove
+                                    | MotionAction::HoverExit
+                            ) {
+                                return android_activity::InputStatus::Unhandled;
+                            }
 
                             if hits_platform_view {
                                 log::debug!(
