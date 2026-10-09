@@ -35,9 +35,9 @@
 use anyhow::{Context as _, Result};
 use futures::channel::oneshot;
 use gpui::{
-    self, AtlasKey, AtlasTile, Capslock, DispatchEventResult, GpuSpecs, Modifiers, PlatformAtlas,
-    PlatformDisplay, PlatformInputHandler, PlatformWindow, PromptButton, PromptLevel,
-    RequestFrameOptions, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    self, AtlasKey, AtlasTile, Capslock, DispatchEventResult, FrameRequestSource, GpuSpecs,
+    Modifiers, PlatformAtlas, PlatformDisplay, PlatformInputHandler, PlatformWindow, PromptButton,
+    PromptLevel, RequestFrameOptions, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowVisibility,
 };
 use gpui_wgpu::{wgpu, GpuContext, WgpuRenderer, WgpuSurfaceConfig};
@@ -1629,10 +1629,19 @@ impl PlatformWindow for AndroidPlatformWindow {
             // A freshly attached surface has an empty swapchain; repaint in full.
             let surface_new = force_render_once.swap(false, std::sync::atomic::Ordering::AcqRel);
 
+            // When and why `frame_source` let this frame through: a vsync, or
+            // demand the pacer served by itself.
+            let (signal_at, signal_source) = super::frame_source::take_signal().map_or(
+                (None, FrameRequestSource::NativeCallback),
+                |(at, source)| (Some(at), source),
+            );
+
             let mut cb = send_callback.lock();
             cb(RequestFrameOptions {
                 require_presentation: false,
                 force_render: text_dirty || surface_new,
+                signal_at,
+                signal_source,
             });
         });
     }

@@ -13,7 +13,10 @@
 //! gpui_ios_request_frame(ptr)  // called every CADisplayLink tick; returns whether GPUI wants another
 //! ```
 
-use gpui::{App, AppContext, Application, RequestFrameOptions, WindowOptions};
+use gpui::{
+    App, AppContext, Application, FrameRequestSource, PlatformFrameSignal, RequestFrameOptions,
+    WindowOptions,
+};
 use std::ffi::c_void;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -313,6 +316,9 @@ pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) -> bool {
     if window_ptr.is_null() {
         return false;
     }
+    // The host calls in from its `CADisplayLink` callback, so this is when the
+    // OS asked for the frame (captured only when GPUI profiles).
+    let signal_at = PlatformFrameSignal::capture(std::time::Instant::now);
 
     // Safety: window_ptr must be a valid pointer to an IosWindow
     let window = unsafe { &*(window_ptr as *const super::window::IosWindow) };
@@ -333,6 +339,8 @@ pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) -> bool {
     if let Some(mut cb) = callback {
         cb(RequestFrameOptions {
             force_render: text_dirty,
+            signal_at,
+            signal_source: FrameRequestSource::NativeCallback,
             ..Default::default()
         });
         // Restore the callback for the next frame

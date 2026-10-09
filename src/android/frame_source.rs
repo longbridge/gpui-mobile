@@ -37,16 +37,22 @@
 //! [`FramePacer`]; this module is the thread-local instance plus the vsync
 //! thread and `ALooper` glue around it. Without a choreographer (no looper
 //! available to the vsync thread) the pacer spaces frames by a 60 Hz clock.
+//!
+//! Each frame also carries when and how it was requested, for GPUI's frame
+//! profiling ([`take_signal`]). Like the desktop backends, the vsync thread
+//! captures the vsync's timestamp only when GPUI's `profiler` feature is on.
 
 use std::{
     cell::RefCell,
     ptr,
     sync::{
         atomic::{AtomicBool, AtomicPtr, Ordering},
-        mpsc, OnceLock,
+        mpsc, LazyLock, OnceLock,
     },
     time::{Duration, Instant},
 };
+
+use gpui::{FrameRequestSource, PlatformFrameSignal};
 
 use crate::frame_pacer::FramePacer;
 
@@ -80,6 +86,14 @@ static POST_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// A frame callback fired and its frame has not been handed to the pacer yet.
 static FRAME_DUE: AtomicBool = AtomicBool::new(false);
+
+/// The timestamp of the vsync behind [`FRAME_DUE`], handed from the vsync
+/// thread to the pacer together with it. Empty unless profiling.
+static VSYNC_SIGNAL: LazyLock<PlatformFrameSignal> = LazyLock::new(PlatformFrameSignal::new);
+
+/// A vsync timestamp older than this when its callback runs is not trusted;
+/// the callback's own arrival time stands in for it.
+const MAX_VSYNC_AGE: Duration = Duration::from_secs(1);
 
 /// Demand raised from a thread that is not the loop thread; the loop turns it
 /// into [`schedule_frame`] on its next iteration.
@@ -169,11 +183,40 @@ fn vsync_thread(ready: mpsc::Sender<bool>) {
 }
 
 unsafe extern "C" fn on_vsync(
-    _frame_time_nanos: std::os::raw::c_long,
+    frame_time_nanos: std::os::raw::c_long,
     _data: *mut std::ffi::c_void,
 ) {
+    if let Some(at) = PlatformFrameSignal::capture(|| vsync_instant(frame_time_nanos)) {
+        VSYNC_SIGNAL.record(at, FrameRequestSource::NativeCallback);
+    }
     FRAME_DUE.store(true, Ordering::Release);
     wake_looper(&MAIN_LOOPER);
+}
+
+/// The vsync's timestamp as an [`Instant`]. `frame_time_nanos` is on
+/// `CLOCK_MONOTONIC`, but an `Instant` cannot be built from raw nanoseconds,
+/// so both clocks are sampled and the callback's arrival time is stepped back
+/// by the vsync's age. The arrival time stands in when the clock read fails
+/// or the age is implausible (the 32-bit `long` of this callback truncates
+/// the timestamp).
+fn vsync_instant(frame_time_nanos: std::os::raw::c_long) -> Instant {
+    let received_at = Instant::now();
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid out-pointer for the duration of the call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return received_at;
+    }
+    let now_nanos = i128::from(now.tv_sec) * 1_000_000_000 + i128::from(now.tv_nsec);
+    let age_nanos = now_nanos - i128::from(frame_time_nanos);
+    if !(0..=MAX_VSYNC_AGE.as_nanos() as i128).contains(&age_nanos) {
+        return received_at;
+    }
+    received_at
+        .checked_sub(Duration::from_nanos(age_nanos as u64))
+        .unwrap_or(received_at)
 }
 
 fn wake_looper(looper: &AtomicPtr<ndk_sys::ALooper>) {
@@ -191,7 +234,7 @@ fn with_pacer<R>(f: impl FnOnce(&FramePacer) -> R) -> Option<R> {
         let slot = slot.borrow();
         let pacer = slot.as_ref()?;
         if FRAME_DUE.swap(false, Ordering::AcqRel) {
-            pacer.on_vsync();
+            pacer.on_vsync(VSYNC_SIGNAL.take().map(|(at, _)| at));
         }
         Some(f(pacer))
     })
@@ -222,6 +265,17 @@ pub(crate) fn take_frame() -> bool {
         schedule_frame();
     }
     with_pacer(|pacer| pacer.take_frame(Instant::now())).unwrap_or(false)
+}
+
+/// When and how the frame the loop just took with [`take_frame`] was
+/// requested, for `RequestFrameOptions::signal_at` / `signal_source`. The
+/// window's frame callback drains it; `None` when the time is unknown.
+///
+/// Unlike the other entry points this does not hand the pacer a vsync that
+/// arrived meanwhile: that vsync owes the *next* frame, and draining it here
+/// would charge its time to this one.
+pub(crate) fn take_signal() -> Option<(Instant, FrameRequestSource)> {
+    PACER.with(|slot| slot.borrow().as_ref()?.take_signal())
 }
 
 /// How long the loop may block on its looper: zero with a frame due, up to

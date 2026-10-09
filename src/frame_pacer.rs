@@ -26,12 +26,21 @@
 //! previous frame, and [`poll_timeout`](Self::poll_timeout) tells the loop
 //! how long it may sleep before then.
 //!
+//! The pacer also remembers why each frame became due, for GPUI's
+//! [`RequestFrameOptions`](gpui::RequestFrameOptions): a vsync is a
+//! [`NativeCallback`](FrameRequestSource::NativeCallback) stamped with the
+//! vsync's own time, while demand served at once or by the fallback clock is
+//! a [`LocalSchedule`](FrameRequestSource::LocalSchedule) stamped with the
+//! moment the pacer let it through.
+//!
 //! Main thread only, like everything in GPUI.
 
 use std::{
     cell::Cell,
     time::{Duration, Instant},
 };
+
+use gpui::FrameRequestSource;
 
 /// Posts one vsync callback that will call [`FramePacer::on_vsync`].
 pub(crate) type PostVsync = Box<dyn Fn()>;
@@ -52,6 +61,10 @@ pub(crate) struct FramePacer {
     fallback_due_at: Cell<Option<Instant>>,
     /// Fallback only: when the previous frame was taken, to space the next.
     last_frame_at: Cell<Option<Instant>>,
+    /// When and how the frame that is due (or was just taken) was requested,
+    /// until [`take_signal`](Self::take_signal) drains it. The first request
+    /// wins, so a frame that stays owed reports its oldest request.
+    signal: Cell<Option<(Instant, FrameRequestSource)>>,
 }
 
 impl FramePacer {
@@ -66,6 +79,7 @@ impl FramePacer {
             due: Cell::new(false),
             fallback_due_at: Cell::new(None),
             last_frame_at: Cell::new(None),
+            signal: Cell::new(None),
         }
     }
 
@@ -78,6 +92,7 @@ impl FramePacer {
             due: Cell::new(false),
             fallback_due_at: Cell::new(None),
             last_frame_at: Cell::new(None),
+            signal: Cell::new(None),
         }
     }
 
@@ -94,7 +109,10 @@ impl FramePacer {
             .get()
             .is_none_or(|last| now.duration_since(last) >= self.interval);
         match &self.post_vsync {
-            Some(_) if interval_elapsed => self.due.set(true),
+            Some(_) if interval_elapsed => {
+                self.due.set(true);
+                self.record_signal(now, FrameRequestSource::LocalSchedule);
+            }
             Some(post) => {
                 self.posted.set(true);
                 post();
@@ -110,9 +128,13 @@ impl FramePacer {
     }
 
     /// The posted vsync callback fired: the frame it owes is now due.
-    pub(crate) fn on_vsync(&self) {
+    /// `signal_at` is the vsync's timestamp, `None` when it was not captured.
+    pub(crate) fn on_vsync(&self, signal_at: Option<Instant>) {
         self.posted.set(false);
         self.due.set(true);
+        if let Some(at) = signal_at {
+            self.record_signal(at, FrameRequestSource::NativeCallback);
+        }
     }
 
     /// Takes the due frame, if any. The loop draws when this returns `true`
@@ -126,9 +148,23 @@ impl FramePacer {
             Some(due_at) if due_at <= now => {
                 self.fallback_due_at.set(None);
                 self.last_frame_at.set(Some(now));
+                self.record_signal(due_at, FrameRequestSource::LocalSchedule);
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Drains when and how the frame [`take_frame`](Self::take_frame) handed
+    /// out was requested; `None` when the request time is unknown (a vsync
+    /// whose timestamp was not captured, or a frame the pacer did not pace).
+    pub(crate) fn take_signal(&self) -> Option<(Instant, FrameRequestSource)> {
+        self.signal.take()
+    }
+
+    fn record_signal(&self, at: Instant, source: FrameRequestSource) {
+        if self.signal.get().is_none() {
+            self.signal.set(Some((at, source)));
         }
     }
 
@@ -224,7 +260,7 @@ mod tests {
         let now = now + Duration::from_millis(1);
 
         pacer.schedule(now);
-        pacer.on_vsync();
+        pacer.on_vsync(None);
         assert_eq!(pacer.poll_timeout(now), Some(Duration::ZERO));
         assert!(pacer.take_frame(now));
         assert!(!pacer.take_frame(now), "a vsync owes exactly one frame");
@@ -241,7 +277,7 @@ mod tests {
         let now = now + Duration::from_millis(1);
 
         pacer.schedule(now);
-        pacer.on_vsync();
+        pacer.on_vsync(None);
         pacer.schedule(now);
 
         assert_eq!(posts.get(), 1);
@@ -275,7 +311,7 @@ mod tests {
         let now = now + Duration::from_millis(1);
 
         pacer.schedule(now);
-        pacer.on_vsync();
+        pacer.on_vsync(None);
         // The loop skips drawing while inactive …
         assert!(pacer.has_demand());
         // … and draws the owed frame once it is active again.
@@ -295,8 +331,8 @@ mod tests {
         assert_eq!(posts.get(), 2);
 
         // The stale callback and the fresh one both fire: still one frame.
-        pacer.on_vsync();
-        pacer.on_vsync();
+        pacer.on_vsync(None);
+        pacer.on_vsync(None);
         assert!(pacer.take_frame(now));
         assert!(!pacer.take_frame(now));
     }
@@ -329,5 +365,74 @@ mod tests {
         pacer.schedule(t0 + Duration::from_millis(5));
         assert!(pacer.take_frame(t0 + Duration::from_millis(5)));
         assert!(!pacer.take_frame(t0 + Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn vsync_frame_reports_the_vsync_time_as_a_native_callback() {
+        let now = Instant::now();
+        let (pacer, _posts) = vsync_pacer_after_frame(now);
+        let _ = pacer.take_signal();
+        let vsync_at = now + Duration::from_millis(3);
+
+        pacer.schedule(now + Duration::from_millis(1));
+        assert_eq!(pacer.take_signal(), None, "nothing is due before the vsync");
+        pacer.on_vsync(Some(vsync_at));
+        assert!(pacer.take_frame(vsync_at + Duration::from_millis(1)));
+
+        assert_eq!(
+            pacer.take_signal(),
+            Some((vsync_at, FrameRequestSource::NativeCallback))
+        );
+        assert_eq!(pacer.take_signal(), None, "a signal is drained once");
+    }
+
+    #[test]
+    fn demand_served_at_once_is_a_local_schedule() {
+        let pacer = FramePacer::with_vsync(Box::new(|| {}), INTERVAL);
+        let now = Instant::now();
+
+        pacer.schedule(now);
+        assert!(pacer.take_frame(now + Duration::from_millis(1)));
+
+        assert_eq!(
+            pacer.take_signal(),
+            Some((now, FrameRequestSource::LocalSchedule))
+        );
+    }
+
+    #[test]
+    fn clock_fallback_reports_the_deadline_it_waited_for() {
+        let pacer = FramePacer::with_clock(INTERVAL);
+        let t0 = Instant::now();
+        pacer.schedule(t0);
+        assert!(pacer.take_frame(t0));
+        let _ = pacer.take_signal();
+
+        pacer.schedule(t0 + Duration::from_millis(1));
+        assert!(pacer.take_frame(t0 + Duration::from_millis(20)));
+
+        assert_eq!(
+            pacer.take_signal(),
+            Some((t0 + INTERVAL, FrameRequestSource::LocalSchedule))
+        );
+    }
+
+    #[test]
+    fn an_owed_frame_keeps_its_first_request_time() {
+        let now = Instant::now();
+        let (pacer, _posts) = vsync_pacer_after_frame(now);
+        let _ = pacer.take_signal();
+        let first = now + Duration::from_millis(2);
+
+        pacer.schedule(now + Duration::from_millis(1));
+        pacer.resume(now + Duration::from_millis(1));
+        pacer.on_vsync(Some(first));
+        pacer.on_vsync(Some(first + INTERVAL));
+        assert!(pacer.take_frame(first + Duration::from_secs(1)));
+
+        assert_eq!(
+            pacer.take_signal(),
+            Some((first, FrameRequestSource::NativeCallback))
+        );
     }
 }
