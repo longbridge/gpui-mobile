@@ -13,12 +13,38 @@ import java.io.IOException;
  *
  * <p>Uses {@link MediaPlayer} for audio playback. All public methods are static
  * and called from Rust via JNI.</p>
+ *
+ * <p>Streams are prepared asynchronously, so no call blocks on the network: until
+ * the stream is ready, play, pause and seek are remembered and applied then.
+ * MediaPlayer delivers its callbacks on the main thread, since the threads that
+ * create players have no Looper.</p>
  */
 public final class GpuiAudio {
 
     private static final String TAG = "GpuiAudio";
     private static final SparseArray<MediaPlayer> sPlayers = new SparseArray<>();
+    private static final SparseArray<Pending> sPending = new SparseArray<>();
     private static int sNextId = 1;
+
+    /**
+     * A player whose source is still being prepared, and what to do once it is.
+     * Read and written only while holding {@code sPlayers}.
+     */
+    private static final class Pending {
+        boolean playWhenReady;
+        long seekMs = -1;
+        float speed = -1;
+    }
+
+    /** Players whose source failed to load, with the reason. */
+    private static final SparseArray<String> sErrors = new SparseArray<>();
+
+    // State codes for getState (must match Rust's audio::android).
+    private static final int STATE_LOADING = 1;
+    private static final int STATE_READY = 2;
+    private static final int STATE_PLAYING = 3;
+    private static final int STATE_PAUSED = 4;
+    private static final int STATE_COMPLETED = 5;
 
     /**
      * Create a new audio player.
@@ -42,26 +68,77 @@ public final class GpuiAudio {
     /**
      * Set the audio source from a URL or file path.
      *
-     * @return Duration in milliseconds, or -1 if unknown/error.
+     * <p>A local file is prepared right away. A stream is prepared in the background;
+     * {@link #getState} reports loading until it is ready, or throws its error.</p>
+     *
+     * @return Duration in milliseconds, or -1 if not known yet.
      */
-    public static long setUrl(Activity activity, int id, String url) {
+    public static long setUrl(Activity activity, int id, String url) throws IOException {
         MediaPlayer mp;
         synchronized (sPlayers) {
             mp = sPlayers.get(id);
+            sErrors.remove(id);
+            sPending.remove(id);
         }
-        if (mp == null) return -1;
+        if (mp == null) throw new IllegalArgumentException("No audio player " + id);
 
-        try {
-            mp.reset();
-            mp.setDataSource(url);
+        mp.reset();
+        mp.setDataSource(url);
+        if (url.startsWith("/") || url.startsWith("file:")) {
             mp.prepare();
             return mp.getDuration();
-        } catch (IOException e) {
-            android.util.Log.e(TAG, "setUrl failed: " + url, e);
-            return -1;
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "setUrl failed: " + url, e);
-            return -1;
+        }
+        prepareAsync(id, mp, new Pending());
+        return -1;
+    }
+
+    private static void prepareAsync(int id, MediaPlayer mp, Pending pending) {
+        synchronized (sPlayers) {
+            sPending.put(id, pending);
+        }
+        mp.setOnPreparedListener(player -> {
+            long seekMs;
+            float speed;
+            boolean play;
+            synchronized (sPlayers) {
+                Pending ready = sPending.get(id);
+                if (ready == null) return;
+                sPending.remove(id);
+                seekMs = ready.seekMs;
+                speed = ready.speed;
+                play = ready.playWhenReady;
+            }
+            if (seekMs >= 0) player.seekTo((int) seekMs);
+            if (speed > 0) applySpeed(player, speed);
+            if (play) player.start();
+        });
+        mp.setOnErrorListener((player, what, extra) -> {
+            synchronized (sPlayers) {
+                sPending.remove(id);
+                sErrors.put(id, "MediaPlayer error " + what + " (" + extra + ")");
+            }
+            return true;
+        });
+        mp.prepareAsync();
+    }
+
+    /** Whether the player is still preparing. */
+    private static boolean preparing(int id) {
+        synchronized (sPlayers) {
+            return sPending.get(id) != null;
+        }
+    }
+
+    /**
+     * If the player is still preparing, record {@code change} for when it is ready
+     * and return true; otherwise return false and leave the call to the player.
+     */
+    private static boolean whenPrepared(int id, java.util.function.Consumer<Pending> change) {
+        synchronized (sPlayers) {
+            Pending pending = sPending.get(id);
+            if (pending == null) return false;
+            change.accept(pending);
+            return true;
         }
     }
 
@@ -75,6 +152,7 @@ public final class GpuiAudio {
         }
         if (mp == null) return;
 
+        if (whenPrepared(id, pending -> pending.playWhenReady = true)) return;
         try {
             mp.start();
         } catch (IllegalStateException e) {
@@ -92,6 +170,7 @@ public final class GpuiAudio {
         }
         if (mp == null) return;
 
+        if (whenPrepared(id, pending -> pending.playWhenReady = false)) return;
         try {
             if (mp.isPlaying()) {
                 mp.pause();
@@ -111,10 +190,14 @@ public final class GpuiAudio {
         }
         if (mp == null) return;
 
+        // Still preparing: just don't start when ready.
+        if (whenPrepared(id, pending -> pending.playWhenReady = false)) return;
         try {
             mp.stop();
-            mp.prepare();
-            mp.seekTo(0);
+            // Back to prepared, at the start, without blocking on the network.
+            Pending pending = new Pending();
+            pending.seekMs = 0;
+            prepareAsync(id, mp, pending);
         } catch (Exception e) {
             android.util.Log.e(TAG, "stop failed", e);
         }
@@ -130,6 +213,7 @@ public final class GpuiAudio {
         }
         if (mp == null) return;
 
+        if (whenPrepared(id, pending -> pending.seekMs = positionMs)) return;
         try {
             mp.seekTo((int) positionMs);
         } catch (IllegalStateException e) {
@@ -165,6 +249,11 @@ public final class GpuiAudio {
         }
         if (mp == null) return;
 
+        if (whenPrepared(id, pending -> pending.speed = speed)) return;
+        applySpeed(mp, speed);
+    }
+
+    private static void applySpeed(MediaPlayer mp, float speed) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             try {
                 PlaybackParams params = mp.getPlaybackParams();
@@ -203,7 +292,7 @@ public final class GpuiAudio {
         synchronized (sPlayers) {
             mp = sPlayers.get(id);
         }
-        if (mp == null) return -1;
+        if (mp == null || preparing(id)) return -1;
 
         try {
             return mp.getCurrentPosition();
@@ -220,7 +309,7 @@ public final class GpuiAudio {
         synchronized (sPlayers) {
             mp = sPlayers.get(id);
         }
-        if (mp == null) return -1;
+        if (mp == null || preparing(id)) return -1;
 
         try {
             return mp.getDuration();
@@ -247,6 +336,32 @@ public final class GpuiAudio {
     }
 
     /**
+     * The player's state: 1 loading, 2 ready, 3 playing, 4 paused, 5 completed.
+     *
+     * @throws IllegalStateException with the reason, if the source failed to load.
+     */
+    public static int getState(int id) {
+        MediaPlayer mp;
+        String error;
+        synchronized (sPlayers) {
+            mp = sPlayers.get(id);
+            error = sErrors.get(id);
+        }
+        if (mp == null) throw new IllegalArgumentException("No audio player " + id);
+        if (error != null) throw new IllegalStateException(error);
+        if (preparing(id)) return STATE_LOADING;
+        try {
+            if (mp.isPlaying()) return STATE_PLAYING;
+            int position = mp.getCurrentPosition();
+            int duration = mp.getDuration();
+            if (duration > 0 && position >= duration) return STATE_COMPLETED;
+            return position > 0 ? STATE_PAUSED : STATE_READY;
+        } catch (IllegalStateException e) {
+            return STATE_READY;
+        }
+    }
+
+    /**
      * Release the player and free resources.
      */
     public static void dispose(int id) {
@@ -254,6 +369,8 @@ public final class GpuiAudio {
         synchronized (sPlayers) {
             mp = sPlayers.get(id);
             sPlayers.remove(id);
+            sPending.remove(id);
+            sErrors.remove(id);
         }
         if (mp == null) return;
 

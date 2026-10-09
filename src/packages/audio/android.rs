@@ -263,19 +263,28 @@ pub fn is_playing(id: u32) -> Result<bool, String> {
 }
 
 pub fn get_state(id: u32) -> Result<PlayerState, String> {
-    let playing = is_playing(id)?;
-    let pos = get_position(id)?;
-    let dur = get_duration(id)?;
-
-    if playing {
-        Ok(PlayerState::Playing)
-    } else if dur > 0 && pos >= dur {
-        Ok(PlayerState::Completed)
-    } else if pos > 0 {
-        Ok(PlayerState::Paused)
-    } else {
-        Ok(PlayerState::Ready)
-    }
+    jni_helpers::with_env(|env| {
+        let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
+        let state = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("getState"),
+                jni::jni_sig!("(I)I"),
+                &[JValue::Int(id as i32)],
+            )
+            .and_then(|v| v.i())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        Ok(match state {
+            1 => PlayerState::Loading,
+            3 => PlayerState::Playing,
+            4 => PlayerState::Paused,
+            5 => PlayerState::Completed,
+            _ => PlayerState::Ready,
+        })
+    })
 }
 
 pub fn dispose(id: u32) -> Result<(), String> {

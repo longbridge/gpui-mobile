@@ -57,6 +57,10 @@ impl AudioPlayer {
 
     /// Set the audio source from a URL (http/https/file).
     /// Returns the duration in milliseconds, or None if unknown.
+    ///
+    /// Does not wait for a stream to load: [`state`](Self::state) is `Loading` until
+    /// it is ready (or an error if it failed), and `play`, `pause` and `seek` made
+    /// meanwhile apply once it is.
     pub fn set_url(&self, url: &str) -> Result<Option<u64>, String> {
         #[cfg(target_os = "android")]
         {
