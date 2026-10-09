@@ -1,7 +1,9 @@
 package dev.gpui.mobile;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
@@ -51,14 +53,17 @@ public final class GpuiLocation {
      *
      * @param activity The current Activity.
      * @param accuracy Accuracy level: 0=lowest, 1=low, 2=medium, 3=high, 4=best, 5=bestForNavigation.
-     * @return A pipe-delimited string of 9 values, or null if the request failed or timed out.
+     * @return A pipe-delimited string of 9 values.
+     * @throws SecurityException without a location permission.
+     * @throws IllegalStateException with no enabled provider, or no fix in time.
      */
-    public static String getCurrentPosition(Activity activity, int accuracy) {
+    public static String getCurrentPosition(Activity activity, int accuracy) throws InterruptedException {
+        requirePermission(activity);
         LocationManager lm = (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
-        if (lm == null) return null;
+        if (lm == null) throw new IllegalStateException("No LocationManager");
 
         String provider = pickProvider(lm, accuracy);
-        if (provider == null) return null;
+        if (provider == null) throw new IllegalStateException("No location provider is enabled");
 
         final CountDownLatch latch = new CountDownLatch(1);
         final AtomicReference<Location> locationRef = new AtomicReference<>(null);
@@ -80,26 +85,13 @@ public final class GpuiLocation {
             public void onProviderDisabled(String provider) {}
         };
 
-        try {
-            lm.requestSingleUpdate(provider, listener, Looper.getMainLooper());
-        } catch (SecurityException e) {
-            android.util.Log.e(TAG, "Location permission denied", e);
-            return null;
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "requestSingleUpdate failed", e);
-            return null;
-        }
-
+        lm.requestSingleUpdate(provider, listener, Looper.getMainLooper());
         try {
             if (!latch.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                lm.removeUpdates(listener);
-                android.util.Log.w(TAG, "getCurrentPosition timed out");
-                return null;
+                throw new IllegalStateException("No location fix within " + TIMEOUT_SECONDS + " s");
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        } finally {
             lm.removeUpdates(listener);
-            return null;
         }
 
         Location loc = locationRef.get();
@@ -112,8 +104,10 @@ public final class GpuiLocation {
      *
      * @param activity The current Activity.
      * @return A pipe-delimited string of 9 values, or null if no cached location exists.
+     * @throws SecurityException without a location permission.
      */
     public static String getLastKnownPosition(Activity activity) {
+        requirePermission(activity);
         LocationManager lm = (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
         if (lm == null) return null;
 
@@ -164,6 +158,14 @@ public final class GpuiLocation {
 
         return lat + "|" + lon + "|" + alt + "|" + acc + "|"
                 + spd + "|" + spdAcc + "|" + hdg + "|" + hdgAcc + "|" + ts;
+    }
+
+    /** Throw, rather than read "no location", when the app may not read it. */
+    private static void requirePermission(Activity activity) {
+        if (activity.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED
+                && activity.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException("Location needs ACCESS_FINE_LOCATION or ACCESS_COARSE_LOCATION");
+        }
     }
 
     /**

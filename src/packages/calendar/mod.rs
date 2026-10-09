@@ -46,6 +46,9 @@ pub struct CalendarEvent {
 }
 
 /// Get all calendars on the device.
+///
+/// Fails without the calendar permission (on Android, `READ_CALENDAR`; creating
+/// and deleting events also need `WRITE_CALENDAR`).
 pub fn get_calendars() -> Result<Vec<Calendar>, String> {
     #[cfg(target_os = "ios")]
     {
