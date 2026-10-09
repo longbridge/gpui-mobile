@@ -304,6 +304,8 @@ struct HostActivity {
 /// the JVM, so `java_vm()` / `activity_as_ptr()` and everything built on them (IME,
 /// safe areas, file pickers, `rustls-platform-verifier`) work exactly as on the
 /// `android-activity` path. A no-op when `android-activity` owns the process.
+/// Call it before `host::start`: the platform reads bundled assets (the emoji font)
+/// when it starts.
 pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<(), String> {
     if ANDROID_APP.get().is_some() {
         return Ok(());
@@ -317,7 +319,76 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
     let mut slot = HOST_ACTIVITY.lock().expect("poisoned");
     slot.previous = slot.current.take();
     slot.current = Some(global);
+    drop(slot);
+    if HOST_ASSETS.get().is_none() {
+        match host_assets(env, activity) {
+            Ok(assets) => {
+                let _ = HOST_ASSETS.set(assets);
+            }
+            Err(err) => {
+                if env.exception_check() {
+                    env.exception_clear();
+                }
+                log::warn!("set_host_activity: no AssetManager: {err}");
+            }
+        }
+    }
     Ok(())
+}
+
+/// The application's `AssetManager`, which `android-activity` provides on the
+/// other path. Taken once, from the first host Activity's application context, and
+/// kept for the life of the process.
+static HOST_ASSETS: OnceLock<HostAssets> = OnceLock::new();
+
+struct HostAssets {
+    /// Keeps the Java `AssetManager`, and so the native one, alive.
+    _java: jni::refs::Global<JObject<'static>>,
+    native: ndk::asset::AssetManager,
+}
+
+fn host_assets(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<HostAssets, String> {
+    let context = env
+        .call_method(
+            activity,
+            jni::jni_str!("getApplicationContext"),
+            jni::jni_sig!("()Landroid/content/Context;"),
+            &[],
+        )
+        .and_then(|value| value.l())
+        .e()?;
+    let assets = env
+        .call_method(
+            &context,
+            jni::jni_str!("getAssets"),
+            jni::jni_sig!("()Landroid/content/res/AssetManager;"),
+            &[],
+        )
+        .and_then(|value| value.l())
+        .e()?;
+    if assets.is_null() {
+        return Err("getAssets returned null".into());
+    }
+    let java = env.new_global_ref(&assets).e()?;
+    // SAFETY: `env` is the current thread's JNI env and `assets` a live AssetManager.
+    let native =
+        unsafe { ndk_sys::AAssetManager_fromJava(env.get_raw() as _, assets.as_raw() as _) };
+    let native = std::ptr::NonNull::new(native).ok_or("AAssetManager_fromJava returned null")?;
+    Ok(HostAssets {
+        _java: java,
+        // SAFETY: `native` belongs to the Java AssetManager that `_java` keeps alive
+        // for as long as this value exists, which is the life of the process.
+        native: unsafe { ndk::asset::AssetManager::from_ptr(native) },
+    })
+}
+
+/// Run `f` with the app's `AssetManager`: from `android-activity`, or from the
+/// Activity passed to [`set_host_activity`] on the host-driven path.
+pub(crate) fn with_asset_manager<T>(f: impl FnOnce(&ndk::asset::AssetManager) -> T) -> Option<T> {
+    if let Some(app) = android_app() {
+        return Some(f(&app.asset_manager()));
+    }
+    HOST_ASSETS.get().map(|assets| f(&assets.native))
 }
 
 /// Public accessor for the JavaVM pointer.
