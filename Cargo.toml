@@ -79,6 +79,12 @@ core-text           = "=21.0.0"
 uuid                = { version = "1", features = ["v4", "v5"] }
 block2              = "0.6"
 
+# libc 0.2.190 dropped the iOS `_dyld_*` symbol declarations that `backtrace`
+# calls in `symbolize/gimli/libs_macos.rs`, which breaks `cargo check` for the
+# apple-ios targets (E0425: cannot find `_dyld_image_header` in `libc`). Pin to
+# the last good release until a fixed libc (>0.2.190) ships.
+libc = "=0.2.189"
+
 # wgpu renderer (Metal backend on iOS/Android)
 gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.8", features = ["font-kit"] }
 wgpu = "29.0.4"
