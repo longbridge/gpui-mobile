@@ -1555,6 +1555,13 @@ pub(crate) fn keyboard_hidden_by_user() {
     }
 }
 
+/// IME event 4 (Done): hide the keyboard, and remember it for a tap to undo as for 5.
+pub(crate) fn keyboard_done() {
+    let shown = *SHOWN_KEYBOARD.lock().expect("poisoned");
+    hide_keyboard_android();
+    *DISMISSED_KEYBOARD.lock().expect("poisoned") = shown;
+}
+
 pub(crate) fn keyboard_dismissed() -> bool {
     DISMISSED_KEYBOARD.lock().expect("poisoned").is_some()
 }

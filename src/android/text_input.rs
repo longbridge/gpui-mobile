@@ -1,8 +1,6 @@
 //! UI-thread IME events are queued, then applied on GPUI's native thread.
 
-use gpui::{
-    DispatchEventResult, KeyDownEvent, Keystroke, Modifiers, PlatformInput, PlatformInputHandler,
-};
+use gpui::PlatformInputHandler;
 use parking_lot::Mutex;
 use std::{
     cell::RefCell,
@@ -37,10 +35,7 @@ pub(super) fn enqueue(event: ImeEvent) {
     }
 }
 
-pub(super) fn drain(
-    slot: &Rc<RefCell<Option<PlatformInputHandler>>>,
-    input: &mut dyn FnMut(PlatformInput) -> DispatchEventResult,
-) {
+pub(super) fn drain(slot: &Rc<RefCell<Option<PlatformInputHandler>>>) {
     let events = std::mem::take(&mut *EVENTS.lock());
     for event in events {
         if event.session != SESSION.load(Ordering::Acquire) {
@@ -55,16 +50,9 @@ pub(super) fn drain(
             continue;
         }
         if event.kind == 4 {
+            // The IME's Done action: hide the keyboard and keep focus, as for 5.
             finish_composition(slot);
-            input(PlatformInput::KeyDown(KeyDownEvent {
-                keystroke: Keystroke {
-                    key: "escape".into(),
-                    key_char: None,
-                    modifiers: Modifiers::default(),
-                },
-                is_held: false,
-                prefer_character_input: false,
-            }));
+            super::jni::keyboard_done();
             continue;
         }
         // No RefCell borrow spans a GPUI update (which may replace the handler).
