@@ -41,3 +41,7 @@ pub fn get_initial_link() -> Result<Option<String>, String> {
 pub fn get_latest_link() -> Option<String> {
     LATEST_LINK.lock().unwrap().clone()
 }
+
+pub(super) fn set_latest_link(url: &str) {
+    *LATEST_LINK.lock().unwrap() = Some(url.to_owned());
+}
