@@ -8,6 +8,8 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
@@ -52,6 +54,8 @@ public class GpuiMediaSession {
                 MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS
         );
 
+        // Called from native threads, which have no Looper: deliver the callbacks
+        // on the main thread.
         sSession.setCallback(new MediaSessionCompat.Callback() {
             @Override
             public void onPlay() {
@@ -88,7 +92,7 @@ public class GpuiMediaSession {
                 Log.i(TAG, "MediaSession callback: onSeekTo " + pos);
                 nativeMediaSeek(pos);
             }
-        });
+        }, new Handler(Looper.getMainLooper()));
 
         sSession.setActive(true);
 

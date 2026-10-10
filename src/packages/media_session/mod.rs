@@ -32,11 +32,15 @@ static ACTION_CALLBACK: Mutex<Option<MediaActionCallback>> = Mutex::new(None);
 static SEEK_CALLBACK: Mutex<Option<MediaSeekCallback>> = Mutex::new(None);
 
 /// Register a callback for media actions from system controls.
+///
+/// On Android it runs on the UI thread.
 pub fn set_action_handler(handler: impl Fn(MediaAction) + Send + 'static) {
     *ACTION_CALLBACK.lock().unwrap() = Some(Box::new(handler));
 }
 
 /// Register a callback for seek requests from system controls.
+///
+/// On Android it runs on the UI thread.
 pub fn set_seek_handler(handler: impl Fn(u64) + Send + 'static) {
     *SEEK_CALLBACK.lock().unwrap() = Some(Box::new(handler));
 }
@@ -44,17 +48,22 @@ pub fn set_seek_handler(handler: impl Fn(u64) + Send + 'static) {
 /// Called from platform code when a media action is received.
 #[allow(dead_code)]
 pub(crate) fn notify_action(action: MediaAction) {
-    if let Some(cb) = ACTION_CALLBACK.lock().unwrap().as_ref() {
-        cb(action);
-    }
+    // Not under the lock, so the handler may replace itself.
+    let Some(handler) = ACTION_CALLBACK.lock().unwrap().take() else {
+        return;
+    };
+    handler(action);
+    ACTION_CALLBACK.lock().unwrap().get_or_insert(handler);
 }
 
 /// Called from platform code when a seek request is received.
 #[allow(dead_code)]
 pub(crate) fn notify_seek(position_ms: u64) {
-    if let Some(cb) = SEEK_CALLBACK.lock().unwrap().as_ref() {
-        cb(position_ms);
-    }
+    let Some(handler) = SEEK_CALLBACK.lock().unwrap().take() else {
+        return;
+    };
+    handler(position_ms);
+    SEEK_CALLBACK.lock().unwrap().get_or_insert(handler);
 }
 
 /// Initialize the media session. Call once before using other functions.
