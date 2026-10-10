@@ -80,7 +80,9 @@ pub fn open_directions(
 
 /// Check if a maps app is available on the device.
 ///
-/// On iOS this always returns `Ok(true)` since Apple Maps is built in.
+/// On iOS this always returns `Ok(true)` since Apple Maps is built in. On Android 11+
+/// (API 30) it is `false` unless the host manifest declares the `geo` scheme in
+/// `<queries>` (see the example's AndroidManifest.xml).
 pub fn is_available() -> Result<bool, String> {
     #[cfg(target_os = "ios")]
     {

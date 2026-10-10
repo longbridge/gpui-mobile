@@ -26,6 +26,11 @@ pub fn launch_url(url: &str) -> Result<bool, String> {
 }
 
 /// Check whether the given URL can be handled by an installed app.
+///
+/// On Android 11+ (API 30) package visibility hides other apps, so this is `false`
+/// unless the host manifest declares the schemes it checks in `<queries>`, e.g.
+/// `<intent><action android:name="android.intent.action.VIEW" /><data android:scheme="https" /></intent>`.
+/// [`launch_url`] works without it.
 pub fn can_launch_url(url: &str) -> Result<bool, String> {
     #[cfg(target_os = "ios")]
     {
