@@ -62,6 +62,8 @@ pub struct Notification {
     pub title: String,
     pub body: String,
     pub channel: NotificationChannel,
+    /// Data for the app when the user taps the notification; on Android, read it with
+    /// [`take_launch_payload`].
     pub payload: Option<String>,
 }
 
@@ -84,6 +86,12 @@ pub fn initialize() -> Result<(), String> {
 }
 
 /// Show an immediate notification.
+///
+/// On Android 13+ this fails unless `POST_NOTIFICATIONS` is granted (request it with
+/// `permission_handler`'s `Permission::Notification`), and whenever the user turned
+/// the app's notifications (or the channel) off, rather than the system dropping it
+/// silently.
+/// Tapping it opens the app.
 pub fn show(notification: &Notification) -> Result<(), String> {
     #[cfg(target_os = "ios")]
     {
@@ -98,6 +106,16 @@ pub fn show(notification: &Notification) -> Result<(), String> {
         let _ = notification;
         Err("notifications are only available on iOS and Android".into())
     }
+}
+
+/// The payload of the notification whose tap opened the app, once; `None` otherwise.
+///
+/// Reads the host Activity's intent. A tap on a running app reaches the launcher
+/// Activity through `onNewIntent` only if it is `singleTask` or `singleTop`, and the
+/// Activity must pass that intent to `setIntent` first.
+#[cfg(target_os = "android")]
+pub fn take_launch_payload() -> Result<Option<String>, String> {
+    android::take_launch_payload()
 }
 
 /// Cancel a specific notification by ID.

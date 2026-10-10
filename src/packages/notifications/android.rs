@@ -104,3 +104,23 @@ pub fn cancel_all() -> Result<(), String> {
         Ok(())
     })
 }
+
+pub fn take_launch_payload() -> Result<Option<String>, String> {
+    jni_helpers::with_env(|env| {
+        let activity = jni_helpers::activity(env)?;
+        let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
+        let payload = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("takeLaunchPayload"),
+                jni::jni_sig!("(Landroid/app/Activity;)Ljava/lang/String;"),
+                &[JValue::Object(&activity)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        Ok((!payload.is_null()).then(|| jni_helpers::get_string(env, &payload)))
+    })
+}
