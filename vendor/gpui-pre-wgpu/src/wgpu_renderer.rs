@@ -2282,7 +2282,12 @@ impl WgpuRenderer {
 
 #[cfg(all(
     not(target_family = "wasm"),
-    any(test, feature = "bench-support", feature = "test-support")
+    any(
+        test,
+        feature = "bench-support",
+        feature = "test-support",
+        feature = "offscreen"
+    )
 ))]
 struct HeadlessRenderTarget {
     texture: wgpu::Texture,
@@ -2291,7 +2296,12 @@ struct HeadlessRenderTarget {
 
 #[cfg(all(
     not(target_family = "wasm"),
-    any(test, feature = "bench-support", feature = "test-support")
+    any(
+        test,
+        feature = "bench-support",
+        feature = "test-support",
+        feature = "offscreen"
+    )
 ))]
 impl HeadlessRenderTarget {
     fn size(&self) -> Size<DevicePixels> {
@@ -2304,7 +2314,12 @@ impl HeadlessRenderTarget {
 
 #[cfg(all(
     not(target_family = "wasm"),
-    any(test, feature = "bench-support", feature = "test-support")
+    any(
+        test,
+        feature = "bench-support",
+        feature = "test-support",
+        feature = "offscreen"
+    )
 ))]
 pub struct WgpuHeadlessRenderer {
     context: WgpuContext,
@@ -2315,11 +2330,53 @@ pub struct WgpuHeadlessRenderer {
 
 #[cfg(all(
     not(target_family = "wasm"),
-    any(test, feature = "bench-support", feature = "test-support")
+    any(
+        test,
+        feature = "bench-support",
+        feature = "test-support",
+        feature = "offscreen"
+    )
 ))]
 impl WgpuHeadlessRenderer {
     pub fn new() -> anyhow::Result<Self> {
         let (context, target_format) = WgpuContext::new_headless()?;
+        Ok(Self::from_headless_context(context, target_format))
+    }
+
+    /// Creates a renderer on a device from `instance` rather than the default
+    /// Vulkan + GL instance, which has no adapter on iOS: pass a Metal instance there.
+    /// Unlike [`Self::new`], the device is not shared with other renderers.
+    #[cfg(feature = "offscreen")]
+    pub fn with_instance(instance: wgpu::Instance) -> anyhow::Result<Self> {
+        let (context, target_format) = WgpuContext::new_headless_with_instance(instance)?;
+        Ok(Self::from_headless_context(context, target_format))
+    }
+
+    /// Renders `scene` into an offscreen texture of `size` and reads it back.
+    #[cfg(feature = "offscreen")]
+    pub fn render_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> anyhow::Result<image::RgbaImage> {
+        self.render(scene, size)?;
+        self.read_image()
+    }
+
+    /// The atlas glyphs and images are rasterized into; a window drawing through
+    /// this renderer must hand it to GPUI as its sprite atlas.
+    #[cfg(feature = "offscreen")]
+    pub fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
+        self.core.atlas.clone()
+    }
+
+    /// The largest width or height, in device pixels, one render can target.
+    #[cfg(feature = "offscreen")]
+    pub fn max_texture_size(&self) -> u32 {
+        self.core.max_texture_size
+    }
+
+    fn from_headless_context(context: WgpuContext, target_format: wgpu::TextureFormat) -> Self {
         // The device may be shared with earlier renderers; observe only errors raised from
         // here on, including any while this renderer builds its pipelines.
         let observed_error_generation = context.errors().current_generation();
@@ -2331,12 +2388,12 @@ impl WgpuHeadlessRenderer {
             wgpu::CompositeAlphaMode::Opaque,
         );
 
-        Ok(Self {
+        Self {
             context,
             core,
             render_target: None,
             observed_error_generation,
-        })
+        }
     }
 
     fn ensure_render_target(&mut self, size: Size<DevicePixels>) -> anyhow::Result<()> {

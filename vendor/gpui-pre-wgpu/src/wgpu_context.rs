@@ -175,9 +175,23 @@ impl WgpuContext {
         ))
     }
 
+    /// Unlike [`Self::new_headless`], creates a fresh device from `instance` on every
+    /// call instead of sharing one, since callers choose different backends.
+    #[cfg(all(not(target_family = "wasm"), feature = "offscreen"))]
+    pub(crate) fn new_headless_with_instance(
+        instance: wgpu::Instance,
+    ) -> anyhow::Result<(Self, wgpu::TextureFormat)> {
+        Self::create_headless(instance)
+    }
+
     #[cfg(all(
         not(target_family = "wasm"),
-        any(test, feature = "bench-support", feature = "test-support")
+        any(
+            test,
+            feature = "bench-support",
+            feature = "test-support",
+            feature = "offscreen"
+        )
     ))]
     pub(crate) fn new_headless() -> anyhow::Result<(Self, wgpu::TextureFormat)> {
         // Creating a device takes tens of milliseconds, and benchmarks create a headless
@@ -192,17 +206,21 @@ impl WgpuContext {
         {
             return Ok((context.clone(), *format));
         }
-        let created = Self::create_headless()?;
+        let created = Self::create_headless(Self::instance(None))?;
         *headless = Some(created.clone());
         Ok(created)
     }
 
     #[cfg(all(
         not(target_family = "wasm"),
-        any(test, feature = "bench-support", feature = "test-support")
+        any(
+            test,
+            feature = "bench-support",
+            feature = "test-support",
+            feature = "offscreen"
+        )
     ))]
-    fn create_headless() -> anyhow::Result<(Self, wgpu::TextureFormat)> {
-        let instance = Self::instance(None);
+    fn create_headless(instance: wgpu::Instance) -> anyhow::Result<(Self, wgpu::TextureFormat)> {
         let device_id_filter = Self::device_id_filter();
         let (adapter, device, queue, dual_source_blending, color_texture_format, target_format) =
             gpui::block_on(async {
@@ -265,7 +283,12 @@ impl WgpuContext {
 
     #[cfg(all(
         not(target_family = "wasm"),
-        any(test, feature = "bench-support", feature = "test-support")
+        any(
+            test,
+            feature = "bench-support",
+            feature = "test-support",
+            feature = "offscreen"
+        )
     ))]
     /// Both candidates are 8-bit RGBA-ordered or BGRA-ordered formats: headless readback
     /// copies rows as 4 bytes per pixel and only swizzles, so no other formats may be added
