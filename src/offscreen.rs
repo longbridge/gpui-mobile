@@ -15,11 +15,11 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use gpui::{
-    App, Bounds, Capslock, DevicePixels, DispatchEventResult, Entity, GpuSpecs,
+    point, px, App, Bounds, Capslock, DevicePixels, DispatchEventResult, Entity, GpuSpecs,
     Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformWindow, Point, PromptButton, PromptLevel, Render, RequestFrameOptions, Scene, Size,
     Window, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowHandle, WindowOptions, WindowParams, WindowVisibility, point, px,
+    WindowHandle, WindowOptions, WindowParams, WindowVisibility,
 };
 use gpui_wgpu::WgpuHeadlessRenderer;
 pub use image::RgbaImage;
@@ -193,14 +193,19 @@ fn create_renderer() -> Result<WgpuHeadlessRenderer> {
     WgpuHeadlessRenderer::new()
 }
 
+/// GPUI's per-window frame callback, driven by [`OffscreenWindow::frame`].
+type FrameCallback = Box<dyn FnMut(RequestFrameOptions)>;
+/// GPUI's per-window resize callback.
+type ResizeCallback = Box<dyn FnMut(Size<Pixels>, f32)>;
+
 struct State {
     bounds: Bounds<Pixels>,
     scale_factor: f32,
     appearance: WindowAppearance,
     renderer: Rc<RefCell<WgpuHeadlessRenderer>>,
     sprite_atlas: Arc<dyn PlatformAtlas>,
-    request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
-    resize: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
+    request_frame: Option<FrameCallback>,
+    resize: Option<ResizeCallback>,
     input_handler: Option<PlatformInputHandler>,
     /// Whether the next `draw` reads its pixels back ([`OffscreenWindow::render`])
     /// or only paints ([`OffscreenWindow::layout`]).
