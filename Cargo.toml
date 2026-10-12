@@ -48,6 +48,9 @@ calendar = []
 deeplink = []
 microphone = []
 media_session = []
+# Render GPUI windows into images (`gpui_mobile::offscreen`). Needs the vendored
+# `gpui-pre-wgpu` (see `[patch.crates-io]`), which exposes its headless renderer.
+offscreen = ["gpui_wgpu/offscreen", "dep:image"]
 
 [lib]
 name = "gpui_mobile"
@@ -61,6 +64,8 @@ log          = { version = "0.4", features = ["kv_unstable_serde", "serde"] }
 parking_lot  = "0.12"
 futures      = "0.3"
 raw-window-handle = "0.6"
+# Same major version as `gpui-pre-wgpu`, whose `RgbaImage` `offscreen` returns.
+image        = { version = "0.25", default-features = false, optional = true }
 
 # ── GPUI core crate (provides Platform trait, event types, geometry, etc.) ───
 gpui = { package = "gpui-pre", version = "=0.3.8", default-features = false }
@@ -139,3 +144,10 @@ strip         = true
 [profile.dev]
 opt-level = 0
 debug     = true
+
+# `gpui-pre-wgpu` 0.3.8 with its headless renderer behind an `offscreen` feature
+# instead of `test-support` / `bench-support`, and a constructor that takes the
+# wgpu instance (iOS needs Metal). Applications that enable `offscreen` must
+# patch it the same way.
+[patch.crates-io]
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }

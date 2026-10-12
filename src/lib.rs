@@ -79,6 +79,8 @@ pub(crate) mod frame_demand;
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub(crate) mod frame_pacer;
 pub mod momentum;
+#[cfg(all(feature = "offscreen", any(target_os = "ios", target_os = "android")))]
+pub mod offscreen;
 pub mod packages;
 pub mod platform_view;
 pub mod target_platform;

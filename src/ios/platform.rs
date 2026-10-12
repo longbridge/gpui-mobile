@@ -161,6 +161,10 @@ impl Platform for IosPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        #[cfg(feature = "offscreen")]
+        if let Some(window) = crate::offscreen::take_pending(&options) {
+            return Ok(window);
+        }
         let window = Box::new(IosWindow::new(handle, options)?);
         // Register the window with FFI layer so Objective-C can access it for rendering
         window.register_with_ffi();
