@@ -408,6 +408,8 @@ impl PlatformWindow for OffscreenPlatformWindow {
 
     fn on_moved(&self, _callback: Box<dyn FnMut()>) {}
 
+    fn on_display_changed(&self, _callback: Box<dyn FnMut()>) {}
+
     fn on_should_close(&self, _callback: Box<dyn FnMut() -> bool>) {}
 
     fn on_hit_test_window_control(&self, _callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
