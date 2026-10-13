@@ -238,6 +238,68 @@ static ANDROID_APP: OnceLock<AndroidApp> = OnceLock::new();
 /// Initialised once during `android_main`; read-only thereafter.
 static PLATFORM: OnceLock<Arc<AndroidPlatform>> = OnceLock::new();
 
+/// Open `url` for the user: offer it to the host Activity first, then fall back to the system.
+///
+/// A host that owns its Activity can implement `boolean gpuiOpenUrl(String)` to route links its
+/// own way (an in-app browser, a native page for its own deep links, or refusing a scheme) and
+/// return `true` once handled. Without that method, or when it returns `false`, the URL goes to
+/// an `ACTION_VIEW` Intent, which the system resolves to a browser or the app registered for it.
+pub fn open_url(url: &str) -> Result<(), String> {
+    with_env(|env| {
+        let activity = activity(env)?;
+        let jurl = env.new_string(url).map_err(|e| e.to_string())?;
+        let handled = env.call_method(
+            &activity,
+            jni::jni_str!("gpuiOpenUrl"),
+            jni::jni_sig!("(Ljava/lang/String;)Z"),
+            &[JValue::Object(&jurl)],
+        );
+        match handled.map(|v| v.z().unwrap_or(false)) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            // The host does not implement the hook: not an error, use the system.
+            Err(_) => env.exception_clear(),
+        }
+        let uri = env
+            .call_static_method(
+                jni::jni_str!("android/net/Uri"),
+                jni::jni_str!("parse"),
+                jni::jni_sig!("(Ljava/lang/String;)Landroid/net/Uri;"),
+                &[JValue::Object(&jurl)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        let action = env
+            .new_string("android.intent.action.VIEW")
+            .map_err(|e| e.to_string())?;
+        let intent = env
+            .new_object(
+                jni::jni_str!("android/content/Intent"),
+                jni::jni_sig!("(Ljava/lang/String;Landroid/net/Uri;)V"),
+                &[JValue::Object(&action), JValue::Object(&uri)],
+            )
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        // No app can handle the URL: startActivity throws ActivityNotFoundException.
+        env.call_method(
+            &activity,
+            jni::jni_str!("startActivity"),
+            jni::jni_sig!("(Landroid/content/Intent;)V"),
+            &[JValue::Object(&intent)],
+        )
+        .map(drop)
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    })
+}
+
 /// Get the unicode character produced by an Android key event via JNI.
 ///
 /// This creates a `android.view.KeyEvent` Java object and calls
