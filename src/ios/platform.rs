@@ -263,6 +263,11 @@ impl Platform for IosPlatform {
         // iOS handles app reopening through scene lifecycle
     }
 
+    fn on_displays_changed(&self, _callback: Box<dyn FnMut()>) {
+        // iOS has no display hot-plug configuration callback like macOS; the
+        // single UIScreen is managed by the scene lifecycle, so this is a no-op.
+    }
+
     fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {
         // iOS doesn't have a menu bar
         // Could potentially integrate with UIMenuBuilder for context menus

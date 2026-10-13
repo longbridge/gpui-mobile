@@ -4,8 +4,9 @@
 //! and possibly an external display via AirPlay or USB-C.
 
 use anyhow::Result;
-use gpui::{px, size, Bounds, DisplayId, Pixels, PlatformDisplay};
+use gpui::{px, refresh_interval_from_hz, size, Bounds, DisplayId, Pixels, PlatformDisplay};
 use objc2::{class, msg_send};
+use std::time::Duration;
 
 use super::cg_types::ObjcCGRect;
 use uuid::Uuid;
@@ -94,5 +95,13 @@ impl PlatformDisplay for IosDisplay {
             origin: Default::default(),
             size: size(px(bounds.width as f32), px(bounds.height as f32)),
         }
+    }
+
+    fn refresh_interval(&self) -> Option<Duration> {
+        // `UIScreen.maximumFramesPerSecond` is the panel's max refresh (60, or 120
+        // on ProMotion). Available since iOS 10.3; returns 0 when unknown, in which
+        // case `refresh_interval_from_hz` yields `None`.
+        let frames_per_second: isize = unsafe { msg_send![self.screen, maximumFramesPerSecond] };
+        refresh_interval_from_hz(frames_per_second as f64)
     }
 }

@@ -1265,6 +1265,10 @@ impl Platform for AndroidPlatform {
         });
     }
 
+    fn on_displays_changed(&self, _callback: Box<dyn FnMut()>) {
+        // Android reports no display hot-plug configuration callback here; no-op.
+    }
+
     fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {
         // No-op: Android doesn't have macOS-style menus.
     }
@@ -1529,6 +1533,9 @@ impl Platform for SharedPlatform {
     }
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         <AndroidPlatform as Platform>::on_reopen(&self.0, callback)
+    }
+    fn on_displays_changed(&self, callback: Box<dyn FnMut()>) {
+        <AndroidPlatform as Platform>::on_displays_changed(&self.0, callback)
     }
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap) {
         <AndroidPlatform as Platform>::set_menus(&self.0, menus, keymap)
