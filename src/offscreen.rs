@@ -166,10 +166,15 @@ impl<V: Render + 'static> OffscreenWindow<V> {
 
     /// Closes the window, dropping its view tree.
     pub fn close(mut self, cx: &mut App) {
-        self.close_on_drop = None;
-        let _ = self
+        // Within the window's own update it can't be reached; the drop below
+        // then closes it from a fresh task instead.
+        if self
             .handle
-            .update(cx, |_, window, _| window.remove_window());
+            .update(cx, |_, window, _| window.remove_window())
+            .is_ok()
+        {
+            self.close_on_drop = None;
+        }
     }
 }
 
