@@ -146,8 +146,9 @@ opt-level = 0
 debug     = true
 
 # `gpui-pre-wgpu` 0.3.8 with its headless renderer behind an `offscreen` feature
-# instead of `test-support` / `bench-support`, and a constructor that takes the
-# wgpu instance (iOS needs Metal). Applications that enable `offscreen` must
-# patch it the same way.
+# instead of `test-support` / `bench-support`, a constructor that takes the wgpu
+# instance (iOS needs Metal), and methods that release its render target and
+# clear its sprite atlas between captures. Applications that enable `offscreen`
+# must patch it the same way.
 [patch.crates-io]
 gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }

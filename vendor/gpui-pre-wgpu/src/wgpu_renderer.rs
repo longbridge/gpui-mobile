@@ -2376,6 +2376,24 @@ impl WgpuHeadlessRenderer {
         self.core.max_texture_size
     }
 
+    /// Drops the textures sized to the last render (the render target and the path
+    /// intermediates), keeping the device, pipelines and atlas. The next render
+    /// recreates them at its own size.
+    #[cfg(feature = "offscreen")]
+    pub fn release_render_target(&mut self) {
+        self.render_target = None;
+        self.core.resources.invalidate_intermediate_textures();
+    }
+
+    /// Drops every glyph and image tile in [`Self::sprite_atlas`], with the bind
+    /// groups that keep their textures alive. Only call it while no window draws
+    /// through the atlas: tiles such a window already holds would dangle.
+    #[cfg(feature = "offscreen")]
+    pub fn clear_sprite_atlas(&mut self) {
+        self.core.resources.atlas_texture_bind_groups.clear();
+        self.core.atlas.clear();
+    }
+
     fn from_headless_context(context: WgpuContext, target_format: wgpu::TextureFormat) -> Self {
         // The device may be shared with earlier renderers; observe only errors raised from
         // here on, including any while this renderer builds its pipelines.
@@ -2795,6 +2813,47 @@ mod tests {
 
         renderer.render_scene(&Scene::default(), device_size(16, 17))?;
         assert_ne!(target_texture(&renderer), first);
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "offscreen"))]
+    #[test]
+    fn headless_renderer_releases_frame_textures() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let key = gpui::AtlasKey::Image(gpui::RenderImageParams {
+            image_id: gpui::ImageId(1),
+            frame_index: 0,
+        });
+        let pixel = device_size(1, 1);
+        let mut build = || Ok(Some((pixel, std::borrow::Cow::Owned(vec![0, 0, 0, 255]))));
+        renderer
+            .sprite_atlas()
+            .get_or_insert_with(key.clone(), &mut build)?
+            .expect("tile should be created");
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(2.0, 2.0, 4.0, 3.0, gpui::red()));
+        scene.finish();
+        renderer.render_to_image(&scene, device_size(13, 7))?;
+        assert!(renderer.render_target.is_some());
+        assert!(renderer.core.resources.path_intermediate_texture.is_some());
+
+        renderer.release_render_target();
+        assert!(renderer.render_target.is_none());
+        assert!(renderer.core.resources.path_intermediate_texture.is_none());
+        assert!(renderer.core.resources.path_msaa_texture.is_none());
+
+        renderer.clear_sprite_atlas();
+        assert!(renderer.core.resources.atlas_texture_bind_groups.is_empty());
+        let mut rebuilt = false;
+        renderer.sprite_atlas().get_or_insert_with(key, &mut || {
+            rebuilt = true;
+            build()
+        })?;
+        assert!(rebuilt, "the cleared atlas should rasterize the tile again");
+
+        // Both are recreated on demand.
+        let image = renderer.render_to_image(&scene, device_size(13, 7))?;
+        assert_pixel(&image, 3, 3, RED);
         Ok(())
     }
 

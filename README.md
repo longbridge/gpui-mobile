@@ -106,10 +106,17 @@ let image = window.render(size(px(390.), content_height))?; // image::RgbaImage
 window.close(cx);
 ```
 
+Dropping an `OffscreenWindow` without calling `close` (for example when the task
+holding it is cancelled) still closes the window, on the next turn of the main
+thread's executor. The GPU device and pipelines are kept for later captures;
+once the last offscreen window closes, the render target sized to the last
+frame and the glyph and image tiles the offscreen windows uploaded are released.
+
 It needs `gpui-pre-wgpu`'s headless renderer, which upstream only builds for
 tests and benchmarks and which picks a Vulkan/GL device that iOS lacks. This
 repository vendors `gpui-pre-wgpu` 0.3.8 with that renderer behind an
-`offscreen` feature and a constructor that takes the wgpu instance
+`offscreen` feature, a constructor that takes the wgpu instance, and methods
+that release its render target and clear its sprite atlas
 (`vendor/gpui-pre-wgpu`). An application enabling `offscreen` must patch it the
 same way:
 

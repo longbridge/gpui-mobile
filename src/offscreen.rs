@@ -9,17 +9,24 @@
 //!
 //! The renderer (one GPU device plus its pipelines) is created on first use and
 //! kept for the rest of the process on the main thread, so later captures skip
-//! device creation and shader compilation.
+//! device creation and shader compilation. What a capture leaves on the GPU (the
+//! render target, sized to the last frame, and the glyph and image tiles of the
+//! atlas the offscreen windows share) is released once the last offscreen window
+//! closes.
 
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::Arc,
+};
 
 use anyhow::{Context as _, Result};
 use gpui::{
-    point, px, App, Bounds, Capslock, DevicePixels, DispatchEventResult, Entity, GpuSpecs,
-    Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, Render, RequestFrameOptions, Scene, Size,
-    Window, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowHandle, WindowOptions, WindowParams, WindowVisibility,
+    point, px, AnyWindowHandle, App, AppContext as _, AsyncApp, Bounds, Capslock, DevicePixels,
+    DispatchEventResult, Entity, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, Render,
+    RequestFrameOptions, Scene, Size, Window, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowHandle, WindowOptions, WindowParams, WindowVisibility,
 };
 use gpui_wgpu::WgpuHeadlessRenderer;
 pub use image::RgbaImage;
@@ -31,14 +38,21 @@ thread_local! {
     static PENDING: RefCell<Option<Rc<RefCell<State>>>> = const { RefCell::new(None) };
     static RENDERER: RefCell<Option<Rc<RefCell<WgpuHeadlessRenderer>>>> =
         const { RefCell::new(None) };
+    /// Offscreen platform windows GPUI has not dropped yet.
+    static OPEN_WINDOWS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// A GPUI window rendered into images instead of onto the screen.
 ///
-/// Dropping the handle leaves the window open; call [`Self::close`].
+/// Close it with [`Self::close`]. Dropping the handle without closing it (for
+/// example when the task capturing it is cancelled) closes the window on the
+/// next turn of the main thread's executor instead, since `Drop` has no `App`.
 pub struct OffscreenWindow<V> {
     handle: WindowHandle<V>,
     state: Rc<RefCell<State>>,
+    /// Closes the window when the handle is dropped; `None` once [`Self::close`]
+    /// has closed it.
+    close_on_drop: Option<AsyncApp>,
 }
 
 impl<V: Render + 'static> OffscreenWindow<V> {
@@ -81,6 +95,7 @@ impl<V: Render + 'static> OffscreenWindow<V> {
         Ok(Self {
             handle: handle?,
             state,
+            close_on_drop: Some(cx.to_async()),
         })
     }
 
@@ -150,10 +165,26 @@ impl<V: Render + 'static> OffscreenWindow<V> {
     }
 
     /// Closes the window, dropping its view tree.
-    pub fn close(self, cx: &mut App) {
+    pub fn close(mut self, cx: &mut App) {
+        self.close_on_drop = None;
         let _ = self
             .handle
             .update(cx, |_, window, _| window.remove_window());
+    }
+}
+
+impl<V> Drop for OffscreenWindow<V> {
+    fn drop(&mut self) {
+        let Some(cx) = self.close_on_drop.take() else {
+            return;
+        };
+        // The handle can be dropped while the `App` is borrowed (inside an update,
+        // or by a task being cancelled), so close the window from a fresh task.
+        let handle: AnyWindowHandle = *self.handle;
+        cx.spawn(async move |cx| {
+            let _ = cx.update_window(handle, |_, window, _| window.remove_window());
+        })
+        .detach();
     }
 }
 
@@ -161,6 +192,7 @@ impl<V: Render + 'static> OffscreenWindow<V> {
 /// [`OffscreenWindow::open`] asked for one.
 pub(crate) fn take_pending(_params: &WindowParams) -> Option<Box<dyn PlatformWindow>> {
     let state = PENDING.with(|pending| pending.borrow_mut().take())?;
+    OPEN_WINDOWS.with(|open| open.set(open.get() + 1));
     Some(Box::new(OffscreenPlatformWindow(state)))
 }
 
@@ -215,6 +247,30 @@ struct State {
 }
 
 struct OffscreenPlatformWindow(Rc<RefCell<State>>);
+
+/// GPUI drops the platform window with the window itself, after its view tree.
+/// Once no offscreen window is left, nothing holds tiles in the shared atlas, so
+/// it and the render target are released; the device and pipelines stay.
+impl Drop for OffscreenPlatformWindow {
+    fn drop(&mut self) {
+        let open = OPEN_WINDOWS.with(|open| {
+            open.set(open.get().saturating_sub(1));
+            open.get()
+        });
+        if open > 0 {
+            return;
+        }
+        let Some(renderer) = RENDERER.with(|slot| slot.borrow().clone()) else {
+            return;
+        };
+        let Ok(mut renderer) = renderer.try_borrow_mut() else {
+            log::warn!("offscreen renderer busy; keeping its textures");
+            return;
+        };
+        renderer.release_render_target();
+        renderer.clear_sprite_atlas();
+    }
+}
 
 // No native window backs it, so there is no handle to report; `NotSupported`
 // is `raw_window_handle`'s variant for exactly this.
