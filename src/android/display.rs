@@ -229,6 +229,12 @@ impl PlatformDisplay for AndroidDisplay {
         DisplayId::new(self.id as u64)
     }
 
+    fn refresh_interval(&self) -> Option<std::time::Duration> {
+        // Android frame pacing is driven by Choreographer, not a queried refresh
+        // interval; report unknown and let the caller fall back to its default.
+        None
+    }
+
     fn uuid(&self) -> Result<uuid::Uuid> {
         // Android NDK does not provide a stable UUID for displays.
         // Synthesise a deterministic v5 UUID from the display id so that

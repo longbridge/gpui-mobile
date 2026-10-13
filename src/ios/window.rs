@@ -1547,6 +1547,11 @@ impl PlatformWindow for IosWindow {
         *self.moved_callback.borrow_mut() = Some(callback);
     }
 
+    fn on_display_changed(&self, _callback: Box<dyn FnMut()>) {
+        // An iOS window stays on the single UIScreen for its lifetime, so there is
+        // no display-change event to report; no-op.
+    }
+
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
         *self.should_close_callback.borrow_mut() = Some(callback);
     }
