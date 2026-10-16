@@ -76,6 +76,7 @@ use gpui::{App, Application, ApplicationHandle};
 use jni::{objects::JObject, refs::Global};
 use ndk::native_window::NativeWindow;
 
+use super::jni::JniResultExt as _;
 use super::platform::{AndroidPlatform, SharedPlatform};
 use crate::android::{AndroidKeyEvent, TouchPoint};
 
@@ -577,18 +578,9 @@ pub fn set_activity(
     if super::jni::android_app().is_some() {
         return Ok(());
     }
-    match env.new_global_ref(activity) {
-        Ok(activity) => {
-            ACTIVITIES.lock().expect("poisoned").insert(host, activity);
-            Ok(())
-        }
-        Err(err) => {
-            if env.exception_check() {
-                env.exception_clear();
-            }
-            Err(err.to_string())
-        }
-    }
+    let activity = env.new_global_ref(activity).or_clear(env)?;
+    ACTIVITIES.lock().expect("poisoned").insert(host, activity);
+    Ok(())
 }
 
 /// Run `f` with `host`'s own Activity (a global `jobject`), or with the newest one if

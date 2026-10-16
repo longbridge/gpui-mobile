@@ -1,6 +1,6 @@
 //! Android Storage Access Framework bridge returning readable local files.
 
-use super::jni::{self as jni_helpers, JniExt};
+use super::jni::{self as jni_helpers, JniExt, JniResultExt as _};
 use anyhow::{anyhow, Result};
 use futures::channel::oneshot;
 use gpui::PathPromptOptions;
@@ -38,10 +38,7 @@ fn pick_files(multiple: bool) -> std::result::Result<Option<Vec<PathBuf>>, Strin
                 &[JValue::Object(&activity), JValue::Bool(multiple)],
             )
             .and_then(|value| value.l())
-            .map_err(|error| {
-                env.exception_clear();
-                error.to_string()
-            })?;
+            .or_clear(env)?;
         if result.is_null() {
             return Ok(None);
         }
