@@ -108,14 +108,20 @@ fn java_vm_safe() -> Result<&'static JavaVM, String> {
     if ptr.is_null() {
         return Err("JavaVM not available".into());
     }
+    // SAFETY: `ptr` is the process's `JavaVM*`, from `android-activity` or from the
+    // host Activity's JNI env; it stays valid for the life of the process.
     Ok(JAVA_VM.get_or_init(|| unsafe { JavaVM::from_raw(ptr as *mut jni::sys::JavaVM) }))
 }
 
 /// Run a closure with an attached `jni::Env` for the current thread.
 ///
-/// In jni 0.22 the `attach_current_thread` API is closure-based.
-/// The thread is auto-detached when the closure returns (if it was
-/// not already attached).
+/// A thread that is not attached yet is attached for good (it detaches when it
+/// exits), so later calls on it are cheap. The closure runs in its own local
+/// reference frame.
+///
+/// A Java exception still pending when the closure returns is cleared and turned into
+/// the returned error, replacing the closure's own result. Clear exceptions where
+/// they happen when a failure is expected.
 pub fn with_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Result<T, String> {
     let vm = java_vm_safe()?;
     let mut result: Option<Result<T, String>> = None;
@@ -127,9 +133,8 @@ pub fn with_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Result
     result.unwrap()
 }
 
-/// Convenience alias: kept so existing callers that import `obtain_env`
-/// compile with minimal changes. Returns a result by running the given
-/// closure inside `with_env`.
+/// Same as [`with_env`].
+#[deprecated(note = "use `with_env`")]
 #[inline]
 pub fn obtain_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Result<T, String> {
     with_env(f)
@@ -223,6 +228,7 @@ pub fn find_app_class<'local>(
         })?;
 
     log::debug!("find_app_class: loaded {class_name}");
+    // SAFETY: `loadClass` returned a `java.lang.Class` local reference in this frame.
     Ok(unsafe { jni::objects::JClass::from_raw(env, loaded.as_raw()) })
 }
 
@@ -1607,6 +1613,8 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeIme(
     end: i32,
 ) {
     let _ = with_env(|env| {
+        // SAFETY: `text` is a local reference JNI passed to this call, valid until it
+        // returns.
         let text = unsafe { JObject::from_raw(env, text as jni::sys::jobject) };
         super::text_input::enqueue(super::text_input::ImeEvent {
             session: session as u64,
@@ -1661,9 +1669,10 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnDeepLink(
     // Use with_env to get a properly wrapped Env handle.
     let url_raw = url as jni::sys::jobject;
     let _ = with_env(|env| {
+        // SAFETY: `url` is a local reference JNI passed to this call, valid until it
+        // returns.
         let url_obj = unsafe { JObject::from_raw(env, url_raw) };
         let url_string = get_string(env, &url_obj);
-        // Don't let the JObject be dropped (it's owned by the JNI call frame).
         if url_string.is_empty() {
             return Ok(());
         }
@@ -1692,6 +1701,8 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiMediaSession_nativeMediaAction
 ) {
     let action_raw = action as jni::sys::jobject;
     let _ = with_env(|env| {
+        // SAFETY: `action` is a local reference JNI passed to this call, valid until
+        // it returns.
         let action_obj = unsafe { JObject::from_raw(env, action_raw) };
         let action_str = get_string(env, &action_obj);
 
