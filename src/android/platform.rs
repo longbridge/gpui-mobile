@@ -1403,6 +1403,13 @@ impl Platform for AndroidPlatform {
         Task::ready(result)
     }
 
+    fn platform_info(&self) -> gpui::PlatformInfo {
+        gpui::PlatformInfo {
+            os: gpui::OperatingSystem::Android,
+            target: gpui::PlatformTarget::Native,
+        }
+    }
+
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
         Box::new(crate::android::keyboard::AndroidKeyboardLayout::new(
             "en-US",
@@ -1625,6 +1632,9 @@ impl Platform for SharedPlatform {
     }
     fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
         <AndroidPlatform as Platform>::delete_credentials(&self.0, url)
+    }
+    fn platform_info(&self) -> gpui::PlatformInfo {
+        <AndroidPlatform as Platform>::platform_info(&self.0)
     }
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
         <AndroidPlatform as Platform>::keyboard_layout(&self.0)
