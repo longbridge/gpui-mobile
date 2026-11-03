@@ -117,6 +117,9 @@ enum Command {
     },
     SurfaceDestroyed {
         host: HostId,
+        /// The `ANativeWindow` being destroyed, when the host knows it. Lets a late destroy
+        /// of a surface the window has already moved off be told apart from the live one.
+        surface: Option<usize>,
     },
     /// The Activity is gone for good — drop its window and everything it holds.
     HostDestroyed {
@@ -352,7 +355,20 @@ fn render_thread(launch: Launch) {
                 } => {
                     on_surface_created(&platform, host, window, scale, &mut app);
                 }
-                Command::SurfaceDestroyed { host } => {
+                Command::SurfaceDestroyed { host, surface } => {
+                    // A host that shows one window through several `SurfaceView`s (one per
+                    // page, the window following whichever page is on top) sees the new page's
+                    // `surfaceCreated` *before* the old page's `surfaceDestroyed`: Android
+                    // brings the incoming page up before it stops the outgoing one. By then
+                    // the window has already moved to the new surface, so that late destroy
+                    // concerns a surface nobody renders into — tearing down the window here
+                    // would unconfigure the live one and leave the new page black.
+                    let current = CURRENT_SURFACE.load(Ordering::SeqCst) as usize;
+                    if surface.is_some_and(|gone| app.attached == Some(host) && gone != current) {
+                        log::info!("gpui-main: host {host} lost a surface it had already left");
+                        DESTROYS_HANDLED.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
                     if let Some(win) = app.windows.get(&host) {
                         // Keeps the renderer (and its atlas) alive; only the surface goes.
                         win.term_window();
@@ -632,6 +648,21 @@ pub fn host_destroyed(host: HostId) {
 /// framework, otherwise the `Surface` is torn down underneath a thread that may be
 /// inside `ANativeWindow_lock`.
 pub fn surface_destroyed(host: HostId) {
+    surface_destroyed_inner(host, None);
+}
+
+/// [`surface_destroyed`] for a known surface: `surface` is the `ANativeWindow` of the
+/// `Surface` being destroyed (`ANativeWindow_fromSurface`, compared by address only).
+///
+/// Use it when one host renders through several `SurfaceView`s in turn. The destroy of a
+/// surface the window has already left (the window followed a newer page's surface) is
+/// then acknowledged without touching the window; any other destroy behaves exactly like
+/// [`surface_destroyed`], blocking until the render thread has let go.
+pub fn surface_destroyed_for(host: HostId, surface: *mut ndk_sys::ANativeWindow) {
+    surface_destroyed_inner(host, Some(surface as usize));
+}
+
+fn surface_destroyed_inner(host: HostId, surface: Option<usize>) {
     // Commands are handled in order, so once the handled count reaches this request's
     // number, this destroy has been handled. A single flag set here and cleared by
     // `SurfaceCreated` could still read "released" from an earlier destroy while a
@@ -639,7 +670,7 @@ pub fn surface_destroyed(host: HostId) {
     // `Surface` go while the render thread is about to draw into it. Numbering relies
     // on every caller being on the Java UI thread, as `SurfaceHolder.Callback` is.
     let request = DESTROYS_REQUESTED.fetch_add(1, Ordering::SeqCst) + 1;
-    post(Command::SurfaceDestroyed { host });
+    post(Command::SurfaceDestroyed { host, surface });
 
     // Bounded wait: a stuck render thread must not turn into an ANR. 2 s is far below
     // the 5 s input-dispatch timeout while being far above a worst-case frame.

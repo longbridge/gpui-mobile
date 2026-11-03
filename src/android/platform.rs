@@ -1224,9 +1224,9 @@ impl Platform for AndroidPlatform {
     }
 
     fn open_url(&self, url: &str) {
-        // A full implementation would call startActivity with an ACTION_VIEW
-        // Intent via JNI.  For now, log the request.
-        log::info!("AndroidPlatform::open_url({url}) — Intent launch not yet implemented");
+        if let Err(error) = super::jni::open_url(url) {
+            log::warn!("AndroidPlatform::open_url({url}) failed: {error}");
+        }
     }
 
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
@@ -1401,6 +1401,13 @@ impl Platform for AndroidPlatform {
     fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
         let result = self.state.lock().credentials.delete(url, "default");
         Task::ready(result)
+    }
+
+    fn platform_info(&self) -> gpui::PlatformInfo {
+        gpui::PlatformInfo {
+            os: gpui::OperatingSystem::Android,
+            target: gpui::PlatformTarget::Native,
+        }
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
@@ -1625,6 +1632,9 @@ impl Platform for SharedPlatform {
     }
     fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
         <AndroidPlatform as Platform>::delete_credentials(&self.0, url)
+    }
+    fn platform_info(&self) -> gpui::PlatformInfo {
+        <AndroidPlatform as Platform>::platform_info(&self.0)
     }
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
         <AndroidPlatform as Platform>::keyboard_layout(&self.0)

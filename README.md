@@ -114,7 +114,7 @@ frame and the glyph and image tiles the offscreen windows uploaded are released.
 
 It needs `gpui-pre-wgpu`'s headless renderer, which upstream only builds for
 tests and benchmarks and which picks a Vulkan/GL device that iOS lacks. This
-repository vendors `gpui-pre-wgpu` 0.3.8 with that renderer behind an
+repository vendors `gpui-pre-wgpu` 0.3.10 with that renderer behind an
 `offscreen` feature, a constructor that takes the wgpu instance, and methods
 that release its render target and clear its sprite atlas
 (`vendor/gpui-pre-wgpu`). An application enabling `offscreen` must patch it the
