@@ -849,14 +849,14 @@ impl AndroidPlatform {
     ///
     /// Returns `None` if the JNI environment is unavailable or the call fails.
     fn query_keyboard_layout_id_via_jni(&self) -> Option<String> {
-        use crate::android::jni::{self as jni_helpers, get_string};
+        use crate::android::jni::{self as jni_helpers, get_string, JniResultExt as _};
         use jni::objects::JValue;
 
         jni_helpers::with_env(|env| {
             let activity = jni_helpers::activity(env)?;
 
             // activity.getSystemService("input_method")
-            let service_name = env.new_string("input_method").map_err(|e| e.to_string())?;
+            let service_name = env.new_string("input_method").or_clear(env)?;
             let imm = env
                 .call_method(
                     &activity,
@@ -865,7 +865,7 @@ impl AndroidPlatform {
                     &[JValue::Object(&service_name)],
                 )
                 .and_then(|v| v.l())
-                .map_err(|e| e.to_string())?;
+                .or_clear(env)?;
             if imm.is_null() {
                 return Ok(None);
             }
@@ -879,7 +879,7 @@ impl AndroidPlatform {
                     &[],
                 )
                 .and_then(|v| v.l())
-                .map_err(|e| e.to_string())?;
+                .or_clear(env)?;
             if subtype.is_null() {
                 return Ok(None);
             }
@@ -893,7 +893,7 @@ impl AndroidPlatform {
                     &[],
                 )
                 .and_then(|v| v.l())
-                .map_err(|e| e.to_string())?;
+                .or_clear(env)?;
 
             let result = get_string(env, &locale_obj).replace('_', "-");
             if result.is_empty() {
@@ -952,15 +952,15 @@ impl AndroidPlatform {
     /// Returns -1 on failure (JNI unavailable, API < 29, etc.).
     #[allow(dead_code)]
     fn query_thermal_status_via_jni(&self) -> i32 {
-        use crate::android::jni as jni_helpers;
+        use crate::android::jni::{self as jni_helpers, JniResultExt as _};
         use jni::objects::JValue;
 
         jni_helpers::with_env(|env| {
             let activity = jni_helpers::activity(env)?;
 
             // activity.getSystemService("power")
-            let service_name = env.new_string("power").map_err(|e| e.to_string())?;
-            let pm = match env
+            let service_name = env.new_string("power").or_clear(env)?;
+            let pm = env
                 .call_method(
                     &activity,
                     jni::jni_str!("getSystemService"),
@@ -968,16 +968,13 @@ impl AndroidPlatform {
                     &[JValue::Object(&service_name)],
                 )
                 .and_then(|v| v.l())
-            {
-                Ok(o) if !o.is_null() => o,
-                _ => {
-                    env.exception_clear();
-                    return Err("getSystemService(power) failed or returned null".to_string());
-                }
-            };
+                .or_clear(env)?;
+            if pm.is_null() {
+                return Err("getSystemService(power) returned null".to_string());
+            }
 
             // pm.getCurrentThermalStatus() — API 29+
-            let status = match env
+            let status = env
                 .call_method(
                     &pm,
                     jni::jni_str!("getCurrentThermalStatus"),
@@ -985,13 +982,7 @@ impl AndroidPlatform {
                     &[],
                 )
                 .and_then(|v| v.i())
-            {
-                Ok(s) => s,
-                Err(_) => {
-                    env.exception_clear();
-                    return Err("getCurrentThermalStatus() failed".to_string());
-                }
-            };
+                .or_clear(env)?;
 
             log::trace!("query_thermal_status_via_jni: status={}", status);
             Ok(status)

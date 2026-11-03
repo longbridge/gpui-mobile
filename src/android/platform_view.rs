@@ -49,7 +49,7 @@ impl AndroidPlatformView {
 
     /// Create the native Android View via JNI.
     fn create_native_view(&self, params: &PlatformViewParams) -> Result<(), String> {
-        use super::jni::{activity, find_app_class, with_env, JniExt};
+        use super::jni::{activity, find_app_class, with_env, JniExt, JniResultExt as _};
         use jni::objects::JValue;
 
         with_env(|env| {
@@ -93,10 +93,8 @@ impl AndroidPlatformView {
                         JValue::Object(&creation_params_jstr),
                     ],
                 )
-                .map_err(|e| {
-                    env.exception_clear();
-                    format!("createView JNI call failed: {}", e)
-                })?;
+                .or_clear(env)
+                .map_err(|e| format!("createView JNI call failed: {}", e))?;
 
             let success = result.z().unwrap_or(false);
             if !success {
@@ -114,77 +112,71 @@ impl AndroidPlatformView {
 
     /// Update the native view's bounds via JNI.
     fn update_native_bounds(&self, bounds: &PlatformViewBounds) {
-        use super::jni::{find_app_class, with_env};
+        use super::jni::{find_app_class, with_env, JniResultExt as _};
         use jni::objects::JValue;
 
         let view_id = self.id.0 as i64;
-        let _ = with_env(|env| {
+        if let Err(err) = with_env(|env| {
             let helper_class = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView")?;
-            let _ = env
-                .call_static_method(
-                    &helper_class,
-                    jni::jni_str!("setBounds"),
-                    jni::jni_sig!("(JFFFF)V"),
-                    &[
-                        JValue::Long(view_id),
-                        JValue::Float(bounds.x),
-                        JValue::Float(bounds.y),
-                        JValue::Float(bounds.width),
-                        JValue::Float(bounds.height),
-                    ],
-                )
-                .map_err(|e| {
-                    env.exception_clear();
-                    format!("setBounds failed: {}", e)
-                })?;
+            env.call_static_method(
+                &helper_class,
+                jni::jni_str!("setBounds"),
+                jni::jni_sig!("(JFFFF)V"),
+                &[
+                    JValue::Long(view_id),
+                    JValue::Float(bounds.x),
+                    JValue::Float(bounds.y),
+                    JValue::Float(bounds.width),
+                    JValue::Float(bounds.height),
+                ],
+            )
+            .or_clear(env)?;
             Ok(())
-        });
+        }) {
+            log::warn!("AndroidPlatformView: setBounds: {err}");
+        }
     }
 
     /// Update the native view's visibility via JNI.
     fn update_native_visibility(&self, visible: bool) {
-        use super::jni::{find_app_class, with_env};
+        use super::jni::{find_app_class, with_env, JniResultExt as _};
         use jni::objects::JValue;
 
         let view_id = self.id.0 as i64;
-        let _ = with_env(|env| {
+        if let Err(err) = with_env(|env| {
             let helper_class = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView")?;
-            let _ = env
-                .call_static_method(
-                    &helper_class,
-                    jni::jni_str!("setVisible"),
-                    jni::jni_sig!("(JZ)V"),
-                    &[JValue::Long(view_id), JValue::Bool(visible)],
-                )
-                .map_err(|e| {
-                    env.exception_clear();
-                    format!("setVisible failed: {}", e)
-                })?;
+            env.call_static_method(
+                &helper_class,
+                jni::jni_str!("setVisible"),
+                jni::jni_sig!("(JZ)V"),
+                &[JValue::Long(view_id), JValue::Bool(visible)],
+            )
+            .or_clear(env)?;
             Ok(())
-        });
+        }) {
+            log::warn!("AndroidPlatformView: setVisible: {err}");
+        }
     }
 
     /// Remove and dispose the native view via JNI.
     fn dispose_native_view(&self) {
-        use super::jni::{find_app_class, with_env};
+        use super::jni::{find_app_class, with_env, JniResultExt as _};
         use jni::objects::JValue;
 
         let view_id = self.id.0 as i64;
-        let _ = with_env(|env| {
+        if let Err(err) = with_env(|env| {
             let helper_class = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView")?;
-            let _ = env
-                .call_static_method(
-                    &helper_class,
-                    jni::jni_str!("disposeView"),
-                    jni::jni_sig!("(J)V"),
-                    &[JValue::Long(view_id)],
-                )
-                .map_err(|e| {
-                    env.exception_clear();
-                    format!("disposeView failed: {}", e)
-                })?;
+            env.call_static_method(
+                &helper_class,
+                jni::jni_str!("disposeView"),
+                jni::jni_sig!("(J)V"),
+                &[JValue::Long(view_id)],
+            )
+            .or_clear(env)?;
             Ok(())
-        });
+        }) {
+            log::warn!("AndroidPlatformView: disposeView: {err}");
+        }
     }
 }
 
@@ -216,25 +208,23 @@ impl PlatformView for AndroidPlatformView {
         if self.disposed.load(Ordering::Relaxed) {
             return;
         }
-        use super::jni::{find_app_class, with_env};
+        use super::jni::{find_app_class, with_env, JniResultExt as _};
         use jni::objects::JValue;
 
         let view_id = self.id.0 as i64;
-        let _ = with_env(|env| {
+        if let Err(err) = with_env(|env| {
             let helper_class = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView")?;
-            let _ = env
-                .call_static_method(
-                    &helper_class,
-                    jni::jni_str!("setZIndex"),
-                    jni::jni_sig!("(JI)V"),
-                    &[JValue::Long(view_id), JValue::Int(z_index)],
-                )
-                .map_err(|e| {
-                    env.exception_clear();
-                    format!("setZIndex failed: {}", e)
-                })?;
+            env.call_static_method(
+                &helper_class,
+                jni::jni_str!("setZIndex"),
+                jni::jni_sig!("(JI)V"),
+                &[JValue::Long(view_id), JValue::Int(z_index)],
+            )
+            .or_clear(env)?;
             Ok(())
-        });
+        }) {
+            log::warn!("AndroidPlatformView: setZIndex: {err}");
+        }
     }
 
     fn dispose(&self) {
