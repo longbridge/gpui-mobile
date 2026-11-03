@@ -21,7 +21,12 @@
 //!
 //! # What the host has to do
 //!
-//! From the Java UI thread, in this order:
+//! Load the native library first, with `System.loadLibrary`, or with
+//! `GpuiLibraryLoader.load` from the example project: in a debuggable build it prefers
+//! a library a dev tool pushed to `files/dev/lib<name>.so`, so Rust changes need no
+//! reinstall.
+//!
+//! Then, from the Java UI thread, in this order:
 //!
 //! 1. In `Activity.onCreate` — every time, recreation included — call
 //!    [`set_activity`] (or [`super::jni::set_host_activity`], which does not tell
