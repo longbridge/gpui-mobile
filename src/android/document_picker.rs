@@ -45,6 +45,8 @@ fn pick_files(multiple: bool) -> std::result::Result<Option<Vec<PathBuf>>, Strin
         if result.is_null() {
             return Ok(None);
         }
+        // SAFETY: `openFiles` is declared to return `String[]`, and `result` is a local
+        // reference in this frame.
         let array = unsafe { JObjectArray::<JObject>::from_raw(env, result.as_raw()) };
         let mut paths = Vec::with_capacity(array.len(env).e()?);
         for index in 0..array.len(env).e()? {
