@@ -543,6 +543,25 @@ fn handle_touches(view: *mut AnyObject, touches: *mut AnyObject, event: *mut Any
     }
 }
 
+/// The first window scene connected to the app, or null if there is none.
+/// In an app that uses scenes, a window shows only once it belongs to one.
+fn connected_window_scene() -> *mut AnyObject {
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
+        let scenes: *mut AnyObject = msg_send![app, connectedScenes];
+        let scenes: *mut AnyObject = msg_send![scenes, allObjects];
+        let count: usize = msg_send![scenes, count];
+        for i in 0..count {
+            let scene: *mut AnyObject = msg_send![scenes, objectAtIndex: i];
+            let is_window_scene: bool = msg_send![scene, isKindOfClass: class!(UIWindowScene)];
+            if is_window_scene {
+                return scene;
+            }
+        }
+        ptr::null_mut()
+    }
+}
+
 /// iOS Window backed by UIWindow + UIViewController.
 
 #[allow(clippy::type_complexity)]
@@ -629,7 +648,12 @@ impl IosWindow {
                 ptr::null_mut()
             } else {
                 let window: *mut AnyObject = msg_send![class!(UIWindow), alloc];
-                msg_send![window, initWithFrame: screen_bounds_cg]
+                let scene = connected_window_scene();
+                if scene.is_null() {
+                    msg_send![window, initWithFrame: screen_bounds_cg]
+                } else {
+                    msg_send![window, initWithWindowScene: scene]
+                }
             };
 
             // Create our custom UIViewController subclass that supports

@@ -540,6 +540,9 @@ fn take_app_callback() -> Option<Box<dyn FnOnce(&mut App)>> {
 /// Consumer crates should call [`set_app_callback`] **before** this function
 /// to register their root view.  If no callback is registered an empty
 /// window is opened as a fallback.
+///
+/// In an app that uses scenes, call it from `scene:willConnectToSession:options:`,
+/// so GPUI's window opens on that scene.
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_run_demo() {
     run_app();

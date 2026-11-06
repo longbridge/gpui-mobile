@@ -113,7 +113,9 @@ void gpui_ios_register_app(void);
 /// empty window is opened as a fallback.
 ///
 /// Call this from application:didFinishLaunchingWithOptions: after
-/// gpui_ios_register_app().
+/// gpui_ios_register_app(). In an app that uses scenes (required when building
+/// with the iOS 27 SDK), call it from scene:willConnectToSession:options:
+/// instead, so GPUI's window opens on that scene.
 void gpui_ios_run_demo(void);
 
 /// Show the software keyboard.

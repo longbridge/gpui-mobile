@@ -1,23 +1,27 @@
 import UIKit
 
 @main
-final class AppDelegate: UIResponder, UIApplicationDelegate {
+final class AppDelegate: UIResponder, UIApplicationDelegate {}
+
+/// Apps built with the iOS 27 SDK must use scenes, so the window lives here.
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
 
-    func application(_ application: UIApplication,
-                     didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        let window = UIWindow(frame: UIScreen.main.bounds)
+    func scene(_ scene: UIScene,
+               willConnectTo session: UISceneSession,
+               options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        let window = UIWindow(windowScene: windowScene)
         window.rootViewController = UINavigationController(rootViewController: MarkdownContainerController())
         window.makeKeyAndVisible()
         self.window = window
-        return true
     }
 
-    func applicationDidBecomeActive(_ application: UIApplication) {
+    func sceneDidBecomeActive(_ scene: UIScene) {
         gpui_ios_did_become_active(nil)
     }
 
-    func applicationWillResignActive(_ application: UIApplication) {
+    func sceneWillResignActive(_ scene: UIScene) {
         gpui_ios_will_resign_active(nil)
     }
 }
