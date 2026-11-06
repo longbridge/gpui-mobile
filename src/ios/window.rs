@@ -568,6 +568,8 @@ pub(crate) struct IosWindow {
     pub(super) frame_demand: Rc<FrameDemand>,
     /// Callback for input events
     input_callback: RefCell<Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>>,
+    /// The last active status sent to GPUI, so a repeat can be skipped.
+    is_active_reported: Cell<Option<bool>>,
     /// Callback for active status changes
     active_status_callback: RefCell<Option<Box<dyn FnMut(bool)>>>,
     visibility_callback: RefCell<Option<Box<dyn FnMut(WindowVisibility)>>>,
@@ -712,6 +714,7 @@ impl IosWindow {
                 request_frame_callback: RefCell::new(None),
                 frame_demand: Rc::new(FrameDemand::default()),
                 input_callback: RefCell::new(None),
+                is_active_reported: Cell::new(None),
                 active_status_callback: RefCell::new(None),
                 visibility_callback: RefCell::new(None),
                 hover_status_callback: RefCell::new(None),
@@ -1212,8 +1215,12 @@ impl IosWindow {
     /// Notify the window of active status changes (foreground/background).
     ///
     /// This is called by the FFI layer when the app transitions between
-    /// foreground and background states.
+    /// foreground and background states. A status that repeats the last one
+    /// is skipped, as on Android.
     pub fn notify_active_status_change(&self, is_active: bool) {
+        if self.is_active_reported.replace(Some(is_active)) == Some(is_active) {
+            return;
+        }
         log::info!("GPUI iOS: Window active status changed to: {}", is_active);
 
         if let Some(callback) = self.active_status_callback.borrow_mut().as_mut() {
