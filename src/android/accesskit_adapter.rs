@@ -3,9 +3,10 @@
 //! Derived from https://github.com/AccessKit/accesskit (0.7.5).
 //! Uses the public adapter/tree APIs so publishing gpui-mobile retains the fixes.
 //! Changes: API 26–28 delegate lookup, UI-thread event enablement check (upstream
-//! c4e9eeb), framework class-loader parent on Android 8/9, and preservation of
-//! foreign delegates during removal. The unchanged embedded dex and Java source
-//! are from the accesskit_android 0.7.5 crates.io release.
+//! c4e9eeb), framework class-loader parent on Android 8/9, preservation of
+//! foreign delegates during removal, and `clickable` on nodes that offer a
+//! click. The unchanged embedded dex and Java source are from the
+//! accesskit_android 0.7.5 crates.io release.
 
 // Copyright 2025 The AccessKit Authors. All rights reserved.
 // Licensed under the Apache License, Version 2.0 (found in
@@ -61,12 +62,18 @@ impl InnerInjectingAdapter {
         host: &JObject,
         virtual_view_id: jint,
     ) -> JObject<'local> {
-        self.adapter.create_accessibility_node_info(
+        let node_info = self.adapter.create_accessibility_node_info(
             &mut *self.activation_handler,
             env,
             host,
             virtual_view_id,
-        )
+        );
+        if !node_info.is_null() && mark_clickable(env, &node_info).is_err() {
+            // Leave the node as accesskit built it; a pending exception must
+            // not reach the framework through this native method.
+            let _ = env.exception_clear();
+        }
+        node_info
     }
 
     fn find_focus<'local>(
@@ -92,6 +99,33 @@ impl InnerInjectingAdapter {
         self.adapter
             .on_hover_event(&mut *self.activation_handler, action, x, y)
     }
+}
+
+/// `AccessibilityNodeInfo.ACTION_CLICK`.
+const ACTION_CLICK: jint = 0x10;
+
+/// accesskit_android 0.7.5 offers `ACTION_CLICK` but never calls
+/// `setClickable`, so every node reports `clickable=false`: UI Automator and
+/// accessibility services that read the flag rather than the action list see
+/// no button as clickable. Mark the node clickable when it offers the action.
+fn mark_clickable(env: &mut JNIEnv, node_info: &JObject) -> Result<()> {
+    let actions = env
+        .call_method(node_info, "getActionList", "()Ljava/util/List;", &[])?
+        .l()?;
+    let count = env.call_method(&actions, "size", "()I", &[])?.i()?;
+    for index in 0..count {
+        let action = env
+            .call_method(&actions, "get", "(I)Ljava/lang/Object;", &[index.into()])?
+            .l()?;
+        let id = env.call_method(&action, "getId", "()I", &[])?.i()?;
+        env.delete_local_ref(action)?;
+        if id == ACTION_CLICK {
+            env.call_method(node_info, "setClickable", "(Z)V", &[true.into()])?;
+            break;
+        }
+    }
+    env.delete_local_ref(actions)?;
+    Ok(())
 }
 
 static NEXT_HANDLE: AtomicI64 = AtomicI64::new(0);
