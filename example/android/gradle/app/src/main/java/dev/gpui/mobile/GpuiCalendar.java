@@ -9,6 +9,10 @@ import android.provider.CalendarContract;
 
 import java.util.TimeZone;
 
+/**
+ * Calendar access for the calendar package. Failures, such as a SecurityException
+ * without the calendar permissions, are thrown to the Rust caller.
+ */
 public final class GpuiCalendar {
 
     public static String getCalendars(Activity activity) {
@@ -41,8 +45,6 @@ public final class GpuiCalendar {
                       .append(readOnly ? "1" : "0").append("|")
                       .append(color & 0xFFFFFFFFL);
             }
-        } catch (Exception e) {
-            android.util.Log.e("GpuiCalendar", "getCalendars failed", e);
         } finally {
             if (cursor != null) cursor.close();
         }
@@ -88,8 +90,6 @@ public final class GpuiCalendar {
                       .append(cursor.getInt(6) != 0 ? "1" : "0").append("|") // allDay
                       .append(cursor.getString(7));  // calendarId
             }
-        } catch (Exception e) {
-            android.util.Log.e("GpuiCalendar", "getEvents failed", e);
         } finally {
             if (cursor != null) cursor.close();
         }
@@ -109,27 +109,14 @@ public final class GpuiCalendar {
         values.put(CalendarContract.Events.ALL_DAY, allDay ? 1 : 0);
         values.put(CalendarContract.Events.EVENT_TIMEZONE, TimeZone.getDefault().getID());
 
-        try {
-            Uri uri = activity.getContentResolver().insert(CalendarContract.Events.CONTENT_URI, values);
-            if (uri != null) {
-                return uri.getLastPathSegment();
-            }
-        } catch (Exception e) {
-            android.util.Log.e("GpuiCalendar", "createEvent failed", e);
-        }
-        return null;
+        Uri uri = activity.getContentResolver().insert(CalendarContract.Events.CONTENT_URI, values);
+        return uri != null ? uri.getLastPathSegment() : null;
     }
 
     public static boolean deleteEvent(Activity activity, String eventId) {
-        try {
-            Uri uri = CalendarContract.Events.CONTENT_URI.buildUpon()
-                .appendPath(eventId).build();
-            int rows = activity.getContentResolver().delete(uri, null, null);
-            return rows > 0;
-        } catch (Exception e) {
-            android.util.Log.e("GpuiCalendar", "deleteEvent failed", e);
-            return false;
-        }
+        Uri uri = CalendarContract.Events.CONTENT_URI.buildUpon()
+            .appendPath(eventId).build();
+        return activity.getContentResolver().delete(uri, null, null) > 0;
     }
 
     private static String nullSafe(String s) { return s != null ? s : ""; }

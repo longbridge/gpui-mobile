@@ -70,6 +70,10 @@ pub fn is_location_service_enabled() -> Result<bool, String> {
 }
 
 /// Get the current position (one-shot).
+///
+/// Blocks until a fix arrives (on Android, at most 30 s), so call it from a
+/// background thread. Fails without a location permission, with location
+/// services off, or without a fix in time.
 #[allow(unused_variables)]
 pub fn get_current_position(settings: &LocationSettings) -> Result<Position, String> {
     #[cfg(target_os = "ios")]
@@ -87,6 +91,9 @@ pub fn get_current_position(settings: &LocationSettings) -> Result<Position, Str
 }
 
 /// Get the last known position (may be stale, faster than current).
+///
+/// `Ok(None)` means no cached position; without a location permission this
+/// fails instead.
 pub fn get_last_known_position() -> Result<Option<Position>, String> {
     #[cfg(target_os = "ios")]
     {
