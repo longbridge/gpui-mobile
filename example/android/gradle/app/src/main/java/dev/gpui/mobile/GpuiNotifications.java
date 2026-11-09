@@ -1,9 +1,13 @@
 package dev.gpui.mobile;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.os.Build;
 
 import androidx.core.app.NotificationCompat;
@@ -18,6 +22,9 @@ public final class GpuiNotifications {
     private static final String DEFAULT_CHANNEL_ID = "default";
     private static final String DEFAULT_CHANNEL_NAME = "Default";
     private static final String DEFAULT_CHANNEL_DESC = "Default notification channel";
+
+    /** Intent extra carrying a tapped notification's payload to the launched Activity. */
+    public static final String EXTRA_PAYLOAD = "dev.gpui.mobile.notification_payload";
 
     /**
      * Initialize the notification system by creating the default notification channel.
@@ -50,14 +57,24 @@ public final class GpuiNotifications {
      * @param channelName Notification channel name.
      * @param channelDesc Notification channel description.
      * @param importance  Importance level (0=min, 1=low, 2=default, 3=high, 4=max).
-     * @param payload     Optional payload string (may be empty).
+     * @param payload     Optional payload string (may be empty), handed to the app
+     *                    when the notification is tapped.
+     * @throws SecurityException when the app may not post notifications, instead of
+     *                    the system dropping it silently.
      */
     public static void show(Activity activity, int id, String title, String body,
                             String channelId, String channelName, String channelDesc,
                             int importance, String payload) {
         NotificationManager nm = (NotificationManager) activity.getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm == null) {
-            return;
+            throw new IllegalStateException("No NotificationManager");
+        }
+        if (Build.VERSION.SDK_INT >= 33
+                && activity.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException("POST_NOTIFICATIONS is not granted; request it first");
+        }
+        if (!nm.areNotificationsEnabled()) {
+            throw new SecurityException("Notifications are turned off for this app");
         }
 
         // Create or update the notification channel (API 26+)
@@ -66,6 +83,11 @@ public final class GpuiNotifications {
             NotificationChannel channel = new NotificationChannel(channelId, channelName, androidImportance);
             channel.setDescription(channelDesc);
             nm.createNotificationChannel(channel);
+            // The user's importance wins over the one just set.
+            NotificationChannel existing = nm.getNotificationChannel(channelId);
+            if (existing != null && existing.getImportance() == NotificationManager.IMPORTANCE_NONE) {
+                throw new SecurityException("Notification channel \"" + channelId + "\" is turned off");
+            }
         }
 
         // Build the notification
@@ -76,7 +98,27 @@ public final class GpuiNotifications {
                 .setAutoCancel(true)
                 .setPriority(mapPriority(importance));
 
+        // Tapping opens the app, with the payload for takeLaunchPayload().
+        Intent launch = activity.getPackageManager().getLaunchIntentForPackage(activity.getPackageName());
+        if (launch != null) {
+            if (payload != null && !payload.isEmpty()) launch.putExtra(EXTRA_PAYLOAD, payload);
+            builder.setContentIntent(PendingIntent.getActivity(activity, id, launch,
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
+        }
+
         nm.notify(id, builder.build());
+    }
+
+    /**
+     * The payload of the notification that opened {@code activity}, removed from its
+     * intent so it is handled once; null if it was not opened from one.
+     */
+    public static String takeLaunchPayload(Activity activity) {
+        Intent intent = activity.getIntent();
+        if (intent == null) return null;
+        String payload = intent.getStringExtra(EXTRA_PAYLOAD);
+        intent.removeExtra(EXTRA_PAYLOAD);
+        return payload;
     }
 
     /**
