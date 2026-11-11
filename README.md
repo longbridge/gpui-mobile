@@ -18,13 +18,13 @@ Implements the `gpui::Platform` trait for mobile targets, following the same arc
 ## GPUI pre-release dependencies
 
 This fork publishes as `gpui-pre-mobile` and uses the crates.io GPUI snapshots
-from GPUI Kit. Version `0.1.0` targets `gpui-pre` and `gpui-pre-wgpu` **0.3.11**.
+from GPUI Kit. Version `0.1.0` targets `gpui-pre` and `gpui-pre-wgpu` **0.3.12**.
 Both are pinned together so the platform, renderer, and application share the
 same GPUI types. No Zed Git checkout or consumer Cargo patches are needed.
 
 ```toml
 [dependencies]
-gpui = { package = "gpui-pre", version = "=0.3.11", default-features = false }
+gpui = { package = "gpui-pre", version = "=0.3.12", default-features = false }
 gpui-mobile = { package = "gpui-pre-mobile", version = "0.1.0" }
 ```
 
@@ -114,7 +114,7 @@ frame and the glyph and image tiles the offscreen windows uploaded are released.
 
 It needs `gpui-pre-wgpu`'s headless renderer, which upstream only builds for
 tests and benchmarks and which picks a Vulkan/GL device that iOS lacks. This
-repository vendors `gpui-pre-wgpu` 0.3.11 with that renderer behind an
+repository vendors `gpui-pre-wgpu` 0.3.12 with that renderer behind an
 `offscreen` feature, a constructor that takes the wgpu instance, and methods
 that release its render target and clear its sprite atlas
 (`vendor/gpui-pre-wgpu`). An application enabling `offscreen` must patch it the
