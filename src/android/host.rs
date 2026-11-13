@@ -583,6 +583,7 @@ pub fn surface_created(host: HostId, window: NativeWindow, scale: f32) {
 
 /// [`super::jni::set_host_activity`], and remember `activity` as `host`'s own, so
 /// what belongs to one host's views (the screen reader) finds that host's Activity.
+/// Platform views (maps, web views, camera previews, videos) move to `activity` too.
 /// Call from `Activity.onCreate`, every time, recreation included.
 pub fn set_activity(
     env: &mut jni::Env<'_>,
@@ -590,6 +591,7 @@ pub fn set_activity(
     activity: &JObject<'_>,
 ) -> Result<(), String> {
     super::jni::set_host_activity(env, activity)?;
+    super::platform_view::attach_to_activity(env, activity);
     if super::jni::android_app().is_some() {
         return Ok(());
     }
