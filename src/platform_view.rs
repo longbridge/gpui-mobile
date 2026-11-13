@@ -37,6 +37,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Unique identifier for a platform view instance.
@@ -58,7 +59,7 @@ impl std::fmt::Display for PlatformViewId {
 }
 
 /// Bounds for positioning a platform view, in logical pixels.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PlatformViewBounds {
     pub x: f32,
     pub y: f32,
@@ -98,6 +99,16 @@ pub trait PlatformView: Send + Sync {
     /// when the view is explicitly hidden.
     fn set_visible(&self, visible: bool);
 
+    /// Clip the native view to `clip`, a rectangle in the same coordinates as
+    /// [`set_bounds`](Self::set_bounds), or remove the clip with `None`.
+    ///
+    /// Native views draw above GPUI content, so a view inside a scroll container
+    /// is clipped to the container's visible area this way. Platforms that cannot
+    /// clip ignore it.
+    fn set_clip(&self, clip: Option<PlatformViewBounds>) {
+        let _ = clip;
+    }
+
     /// Set the z-order of the native view.
     ///
     /// Higher values are drawn on top. GPUI content rendered after the
@@ -134,6 +145,10 @@ pub trait PlatformViewFactory: Send + Sync {
 /// disposal on drop.
 pub struct PlatformViewHandle {
     view: Box<dyn PlatformView>,
+    /// What the app asked for with [`PlatformViewHandle::set_visible`].
+    visible: AtomicBool,
+    /// Whether the element hosting the view was painted, and not clipped out.
+    on_screen: AtomicBool,
 }
 
 impl std::fmt::Debug for PlatformViewHandle {
@@ -148,7 +163,11 @@ impl std::fmt::Debug for PlatformViewHandle {
 impl PlatformViewHandle {
     /// Create a new handle wrapping the given view.
     pub fn new(view: Box<dyn PlatformView>) -> Self {
-        Self { view }
+        Self {
+            view,
+            visible: AtomicBool::new(true),
+            on_screen: AtomicBool::new(true),
+        }
     }
 
     /// Get the view's unique identifier.
@@ -171,8 +190,34 @@ impl PlatformViewHandle {
     }
 
     /// Show or hide the view.
+    ///
+    /// Native views draw above GPUI content: hide one while a GPUI overlay (a
+    /// dialog, a sheet, a menu) covers it. A view hidden here stays hidden while
+    /// its element is painted.
     pub fn set_visible(&self, visible: bool) {
-        self.view.set_visible(visible);
+        self.visible.store(visible, Ordering::Relaxed);
+        self.sync_visibility();
+    }
+
+    /// Whether the app wants the view shown (see [`set_visible`](Self::set_visible)).
+    pub fn is_visible(&self) -> bool {
+        self.visible.load(Ordering::Relaxed)
+    }
+
+    /// Called by the hosting element: whether it is on screen this frame.
+    pub fn set_on_screen(&self, on_screen: bool) {
+        self.on_screen.store(on_screen, Ordering::Relaxed);
+        self.sync_visibility();
+    }
+
+    fn sync_visibility(&self) {
+        let shown = self.visible.load(Ordering::Relaxed) && self.on_screen.load(Ordering::Relaxed);
+        self.view.set_visible(shown);
+    }
+
+    /// Clip the view to a rectangle in window coordinates, or remove the clip.
+    pub fn set_clip(&self, clip: Option<PlatformViewBounds>) {
+        self.view.set_clip(clip);
     }
 
     /// Set the z-order.
