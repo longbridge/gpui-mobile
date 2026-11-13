@@ -679,22 +679,22 @@ public final class GpuiCamera {
      * becomes available, a capture session is created automatically.
      * The view is NOT added to the hierarchy — the caller (GpuiPlatformView) handles that.</p>
      *
-     * @param activity  The current Activity.
+     * @param context   The view context (the platform view host's, which follows Activity recreation).
      * @param handleId  Camera session handle ID.
      * @return A configured TextureView, or an empty FrameLayout if the session is not found.
      */
-    public static android.view.View createPreviewSurface(Activity activity, int handleId) {
+    public static android.view.View createPreviewSurface(Context context, int handleId) {
         CameraSession session;
         synchronized (sSessions) {
             session = sSessions.get(handleId);
         }
         if (session == null || session.device == null) {
             android.util.Log.w(TAG, "createPreviewSurface: session " + handleId + " not found");
-            return new android.widget.FrameLayout(activity);
+            return new android.widget.FrameLayout(context);
         }
 
         final CameraSession s = session;
-        android.view.TextureView tv = new android.view.TextureView(activity);
+        android.view.TextureView tv = new android.view.TextureView(context);
         s.textureView = tv;
 
         tv.setSurfaceTextureListener(new android.view.TextureView.SurfaceTextureListener() {
