@@ -1,94 +1,149 @@
 package dev.gpui.mobile;
 
 import android.app.Activity;
+import android.content.Context;
+import android.content.MutableContextWrapper;
+import android.graphics.Bitmap;
+import android.graphics.Rect;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
-import android.webkit.WebChromeClient;
 import android.widget.FrameLayout;
+import java.lang.ref.WeakReference;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Helper class for managing native platform views embedded in the GPUI render tree.
+ * Native Android views embedded in the GPUI render tree (hybrid composition).
  *
- * Platform views are native Android Views positioned absolutely over the
- * NativeActivity's content area. GPUI controls their position and visibility
- * via JNI calls from Rust.
+ * <p>Each platform view lives in its own FrameLayout container, positioned in
+ * logical pixels over the GPUI surface inside one root FrameLayout added on top
+ * of the Activity's content. Views draw above GPUI content; touches inside a
+ * view go to it, and touches elsewhere fall through the root to the GPUI
+ * surface underneath.</p>
  *
- * Supports view types:
- * - "container": Generic empty FrameLayout (for custom content)
- * - Additional types can be registered via registerViewType()
+ * <p>Views outlive their Activity: GPUI's render thread and app state live for
+ * the whole process, so when the Activity is recreated (a configuration change
+ * the host doesn't handle, {@code Activity.recreate()}, "Don't keep
+ * activities") {@link #attachToActivity} moves every container into the new
+ * Activity. Views are built on a {@link MutableContextWrapper} whose base
+ * context is switched to the new Activity, so they don't keep the old one.
+ * gpui-mobile calls {@code attachToActivity} from {@code host::set_activity}.</p>
+ *
+ * <p>Every method may be called from any thread; work on views is posted to the
+ * main thread in call order.</p>
+ *
+ * View types: "container", "video_player", "webview", "camera_preview", "map", and
+ * any an app adds with {@link #registerViewType}.
  */
 public class GpuiPlatformView {
+    /** Builds the native view for a view type an app registers (a map SDK's view, say). */
+    public interface ViewFactory {
+        /**
+         * @param context  the view context; it follows Activity recreation
+         * @param viewId   the platform view's ID, as Rust's PlatformViewHandle::id reports it
+         * @param params   the creation params Rust passed
+         */
+        View create(Context context, long viewId, Map<String, String> params);
+    }
+
+    private static final Map<String, ViewFactory> factories = new ConcurrentHashMap<>();
+
+    /**
+     * Build views of {@code viewType} with {@code factory}, replacing a built-in type
+     * of the same name. Call it before Rust creates such a view, e.g. in onCreate.
+     * Rust creates them through an AndroidPlatformViewFactory for the same type; find
+     * the view later with {@link #getView}.
+     */
+    public static void registerViewType(String viewType, ViewFactory factory) {
+        factories.put(viewType, factory);
+    }
+
     private static final String TAG = "GpuiPlatformView";
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
 
-    /** Map of view ID -> native View */
-    private static final Map<Long, View> views = new HashMap<>();
+    // Main thread only, except getView/getContainer/web state reads.
+    private static final Map<Long, View> views = new ConcurrentHashMap<>();
+    private static final Map<Long, FrameLayout> containers = new LinkedHashMap<>();
+    private static final Map<Long, MutableContextWrapper> contexts = new HashMap<>();
+    private static final Map<Long, Boolean> hidden = new HashMap<>();
+    /** Clip rectangles in logical window coordinates {x, y, width, height}. */
+    private static final Map<Long, float[]> clips = new HashMap<>();
+    private static final Map<Long, WebState> webStates = new ConcurrentHashMap<>();
 
-    /** Map of view ID -> FrameLayout container */
-    private static final Map<Long, FrameLayout> containers = new HashMap<>();
-
-    /** The root FrameLayout that hosts all platform views */
+    /** The root FrameLayout that hosts all platform views, in {@link #currentActivity}. */
     private static FrameLayout rootContainer;
+    private static WeakReference<Activity> currentActivity = new WeakReference<>(null);
+
+    // ── Activity lifecycle ───────────────────────────────────────────────
 
     /**
-     * Ensure the root container exists in the activity's view hierarchy.
-     * Platform views are added as children of this container.
+     * Use {@code activity} as the host of all platform views from now on: move
+     * existing ones into it. Call from every {@code onCreate}; a no-op for the
+     * Activity already hosting them.
      */
-    private static void ensureRootContainer(Activity activity) {
-        if (rootContainer != null) {
-            return;
-        }
-
-        mainHandler.post(() -> {
-            if (rootContainer != null) return;
-
-            rootContainer = new FrameLayout(activity);
-            rootContainer.setLayoutParams(new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            ));
-
-            // Add to the activity's content view on top of the NativeActivity surface.
-            // NativeActivity uses an internal SurfaceView for native rendering.
-            // addContentView adds to the end of the window's DecorView, which
-            // renders ON TOP of the NativeActivity's SurfaceView.
-            activity.addContentView(rootContainer, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            ));
-
-            // Log the view hierarchy for debugging
-            try {
-                View decorView = activity.getWindow().getDecorView();
-                logViewHierarchy(decorView, 0);
-            } catch (Exception e) {
-                Log.w(TAG, "Could not log view hierarchy: " + e.getMessage());
-            }
-
-            Log.i(TAG, "Root container created and added to activity");
-        });
+    public static void attachToActivity(Activity activity) {
+        mainHandler.post(() -> attachOnMain(activity));
     }
 
+    private static void attachOnMain(Activity activity) {
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
+        if (currentActivity.get() == activity) return;
+        currentActivity = new WeakReference<>(activity);
+        FrameLayout oldRoot = rootContainer;
+        rootContainer = null;
+        if (oldRoot != null) {
+            detach(oldRoot);
+        }
+        if (containers.isEmpty()) {
+            // Created on the first createView.
+            return;
+        }
+        FrameLayout root = ensureRoot();
+        for (Map.Entry<Long, FrameLayout> entry : containers.entrySet()) {
+            FrameLayout container = entry.getValue();
+            detach(container);
+            MutableContextWrapper context = contexts.get(entry.getKey());
+            if (context != null) context.setBaseContext(activity);
+            root.addView(container);
+        }
+        Log.i(TAG, "Moved " + containers.size() + " platform view(s) to " + activity);
+    }
+
+    private static void detach(View view) {
+        ViewGroup parent = (ViewGroup) view.getParent();
+        if (parent != null) parent.removeView(view);
+    }
+
+    /** The root container in the current Activity, created on first use. Main thread. */
+    private static FrameLayout ensureRoot() {
+        if (rootContainer != null) return rootContainer;
+        Activity activity = currentActivity.get();
+        if (activity == null) return null;
+        FrameLayout root = new FrameLayout(activity);
+        // addContentView puts it after the host's own views (the GPUI SurfaceView), so on top.
+        activity.addContentView(root, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        rootContainer = root;
+        Log.i(TAG, "Root container added to " + activity);
+        return root;
+    }
+
+    // ── Creation and layout ──────────────────────────────────────────────
+
     /**
-     * Create a new platform view and add it to the view hierarchy.
+     * Create a platform view and add it to the view hierarchy.
      *
-     * @param activity       The hosting Activity
-     * @param viewType       The type of view to create (e.g., "container", "video_player", "webview")
-     * @param viewId         Unique ID for this view instance
-     * @param x              Left position in logical pixels
-     * @param y              Top position in logical pixels
-     * @param width          Width in logical pixels
-     * @param height         Height in logical pixels
-     * @param creationParams Pipe-delimited key=value pairs (e.g., "player_id=1|url=https://...")
-     * @return true if the view was created successfully
+     * @param creationParams Pipe-delimited key=value pairs (e.g. "player_id=1|url=https://...")
+     * @return true: the view is created asynchronously on the main thread
      */
     public static boolean createView(
             Activity activity,
@@ -99,46 +154,38 @@ public class GpuiPlatformView {
             String creationParams) {
 
         Log.i(TAG, "createView: type=" + viewType + " id=" + viewId
-                + " bounds=(" + x + ", " + y + ", " + width + ", " + height + ")"
-                + " params=" + creationParams);
+                + " bounds=(" + x + ", " + y + ", " + width + ", " + height + ")");
 
-        ensureRootContainer(activity);
-
-        // Parse creation params
         Map<String, String> params = parseCreationParams(creationParams);
 
         mainHandler.post(() -> {
             try {
-                float density = activity.getResources().getDisplayMetrics().density;
+                attachOnMain(activity);
+                Activity host = currentActivity.get();
+                if (host == null) host = activity;
+                MutableContextWrapper context = new MutableContextWrapper(host);
+                float density = context.getResources().getDisplayMetrics().density;
 
-                // Create a container FrameLayout for this platform view
-                FrameLayout container = new FrameLayout(activity);
+                FrameLayout container = new FrameLayout(context);
                 FrameLayout.LayoutParams layoutParams = new FrameLayout.LayoutParams(
-                    (int)(width * density),
-                    (int)(height * density)
-                );
-                layoutParams.leftMargin = (int)(x * density);
-                layoutParams.topMargin = (int)(y * density);
+                        Math.round(width * density), Math.round(height * density));
+                layoutParams.leftMargin = Math.round(x * density);
+                layoutParams.topMargin = Math.round(y * density);
                 container.setLayoutParams(layoutParams);
 
-                // Create the actual view based on type
-                View view = createViewForType(activity, viewType, params);
+                View view = createViewForType(context, viewType, viewId, params);
                 if (view != null) {
                     container.addView(view, new FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT
-                    ));
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT));
                 }
 
-                // Store references
                 views.put(viewId, view != null ? view : container);
                 containers.put(viewId, container);
+                contexts.put(viewId, context);
 
-                // Add to root container
-                if (rootContainer != null) {
-                    rootContainer.addView(container);
-                }
-
+                FrameLayout root = ensureRoot();
+                if (root != null) root.addView(container);
                 Log.i(TAG, "View created: id=" + viewId + " type=" + viewType);
             } catch (Exception e) {
                 Log.e(TAG, "Failed to create view: " + e.getMessage(), e);
@@ -150,7 +197,8 @@ public class GpuiPlatformView {
 
     /**
      * Parse a pipe-delimited creation params string into a map.
-     * Format: "key1=value1|key2=value2"
+     * Format: "key1=value1|key2=value2", with "%" and "|" in keys and values
+     * escaped as "%25" and "%7C".
      */
     private static Map<String, String> parseCreationParams(String params) {
         Map<String, String> map = new HashMap<>();
@@ -158,105 +206,51 @@ public class GpuiPlatformView {
         for (String pair : params.split("\\|")) {
             int eq = pair.indexOf('=');
             if (eq > 0) {
-                map.put(pair.substring(0, eq), pair.substring(eq + 1));
+                map.put(unescape(pair.substring(0, eq)), unescape(pair.substring(eq + 1)));
             }
         }
         return map;
     }
 
-    /**
-     * Create a View instance based on the view type string and creation params.
-     */
-    private static View createViewForType(Activity activity, String viewType, Map<String, String> params) {
+    private static String unescape(String value) {
+        return value.replace("%7C", "|").replace("%25", "%");
+    }
+
+    private static View createViewForType(
+            Context context, String viewType, long viewId, Map<String, String> params) {
+        ViewFactory factory = factories.get(viewType);
+        if (factory != null) {
+            return factory.create(context, viewId, params);
+        }
         switch (viewType) {
             case "container":
-                FrameLayout frame = new FrameLayout(activity);
+                FrameLayout frame = new FrameLayout(context);
                 frame.setBackgroundColor(0x00000000);
                 return frame;
-
             case "video_player":
-                return createVideoPlayerView(activity, params);
-
+                return GpuiVideoPlayer.createVideoSurface(context, parseInt(params.get("player_id")));
             case "webview":
-                return createWebViewView(activity, params);
-
+                return createWebView(context, viewId, params);
             case "camera_preview":
-                return createCameraPreviewView(activity, params);
-
+                return GpuiCamera.createPreviewSurface(context, parseInt(params.get("session_id")));
             case "map":
-                // Placeholder — MapView requires Google Play Services SDK
-                FrameLayout mapContainer = new FrameLayout(activity);
-                mapContainer.setBackgroundColor(0xFFE0E0E0);
-                return mapContainer;
-
+                return new GpuiMapView(context, params);
             default:
                 Log.w(TAG, "Unknown view type: " + viewType + ", creating empty container");
-                return new FrameLayout(activity);
+                return new FrameLayout(context);
         }
     }
 
-    /**
-     * Create a TextureView for video playback and wire it to the MediaPlayer.
-     */
-    private static View createVideoPlayerView(Activity activity, Map<String, String> params) {
-        int playerId = 0;
+    private static int parseInt(String value) {
         try {
-            playerId = Integer.parseInt(params.getOrDefault("player_id", "0"));
+            return value == null ? 0 : Integer.parseInt(value);
         } catch (NumberFormatException e) {
-            Log.w(TAG, "Invalid player_id in creation params");
+            Log.w(TAG, "Invalid integer creation param: " + value);
+            return 0;
         }
-
-        return GpuiVideoPlayer.createVideoSurface(activity, playerId);
     }
 
-    /**
-     * Create a WebView with settings from creation params.
-     */
-    private static View createWebViewView(Activity activity, Map<String, String> params) {
-        boolean jsEnabled = Boolean.parseBoolean(params.getOrDefault("javascript_enabled", "true"));
-        boolean domStorage = Boolean.parseBoolean(params.getOrDefault("dom_storage_enabled", "true"));
-        boolean zoom = Boolean.parseBoolean(params.getOrDefault("zoom_enabled", "true"));
-        String url = params.getOrDefault("url", "");
-        String html = params.getOrDefault("html", "");
-
-        WebView wv = new WebView(activity);
-        WebSettings settings = wv.getSettings();
-        settings.setJavaScriptEnabled(jsEnabled);
-        settings.setDomStorageEnabled(domStorage);
-        settings.setBuiltInZoomControls(zoom);
-        if (zoom) settings.setDisplayZoomControls(false);
-        settings.setLoadWithOverviewMode(true);
-        settings.setUseWideViewPort(true);
-
-        wv.setWebViewClient(new WebViewClient());
-        wv.setWebChromeClient(new WebChromeClient());
-
-        if (!html.isEmpty()) {
-            wv.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null);
-        } else if (!url.isEmpty()) {
-            wv.loadUrl(url);
-        }
-
-        return wv;
-    }
-
-    /**
-     * Create a TextureView for camera preview and wire it to the camera session.
-     */
-    private static View createCameraPreviewView(Activity activity, Map<String, String> params) {
-        int sessionId = 0;
-        try {
-            sessionId = Integer.parseInt(params.getOrDefault("session_id", "0"));
-        } catch (NumberFormatException e) {
-            Log.w(TAG, "Invalid session_id in creation params");
-        }
-
-        return GpuiCamera.createPreviewSurface(activity, sessionId);
-    }
-
-    /**
-     * Update a view's position and size.
-     */
+    /** Update a view's position and size, in logical pixels relative to the window. */
     public static void setBounds(long viewId, float x, float y, float width, float height) {
         mainHandler.post(() -> {
             FrameLayout container = containers.get(viewId);
@@ -264,34 +258,56 @@ public class GpuiPlatformView {
                 Log.w(TAG, "setBounds: no container for id=" + viewId);
                 return;
             }
-
-            Activity activity = (Activity) container.getContext();
-            float density = activity.getResources().getDisplayMetrics().density;
-
+            float density = container.getResources().getDisplayMetrics().density;
             FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) container.getLayoutParams();
-            params.leftMargin = (int)(x * density);
-            params.topMargin = (int)(y * density);
-            params.width = (int)(width * density);
-            params.height = (int)(height * density);
+            params.leftMargin = Math.round(x * density);
+            params.topMargin = Math.round(y * density);
+            params.width = Math.round(width * density);
+            params.height = Math.round(height * density);
             container.setLayoutParams(params);
+            applyClip(container, clips.get(viewId));
         });
     }
 
     /**
-     * Show or hide a platform view.
+     * Clip a view to a rectangle in logical pixels relative to the window (the GPUI
+     * content mask, so a view inside a scroll container doesn't draw over what
+     * surrounds it). A negative width removes the clip.
      */
+    public static void setClip(long viewId, float x, float y, float width, float height) {
+        mainHandler.post(() -> {
+            FrameLayout container = containers.get(viewId);
+            if (container == null) return;
+            float[] clip = width < 0 ? null : new float[] {x, y, width, height};
+            if (clip == null) clips.remove(viewId); else clips.put(viewId, clip);
+            applyClip(container, clip);
+        });
+    }
+
+    private static void applyClip(FrameLayout container, float[] clip) {
+        if (clip == null) {
+            container.setClipBounds(null);
+            return;
+        }
+        float density = container.getResources().getDisplayMetrics().density;
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) container.getLayoutParams();
+        int left = Math.round(clip[0] * density) - params.leftMargin;
+        int top = Math.round(clip[1] * density) - params.topMargin;
+        container.setClipBounds(new Rect(
+                left, top, left + Math.round(clip[2] * density), top + Math.round(clip[3] * density)));
+    }
+
+    /** Show or hide a platform view. */
     public static void setVisible(long viewId, boolean visible) {
         mainHandler.post(() -> {
             FrameLayout container = containers.get(viewId);
             if (container == null) return;
+            hidden.put(viewId, !visible);
             container.setVisibility(visible ? View.VISIBLE : View.GONE);
         });
     }
 
-    /**
-     * Set the z-order of a platform view.
-     * Uses View.setZ() (API 21+) for elevation-based ordering.
-     */
+    /** Set the z-order between platform views (View.setZ). */
     public static void setZIndex(long viewId, int zIndex) {
         mainHandler.post(() -> {
             FrameLayout container = containers.get(viewId);
@@ -300,112 +316,75 @@ public class GpuiPlatformView {
         });
     }
 
-    /**
-     * Remove and dispose a platform view.
-     */
+    /** Remove and dispose a platform view. */
     public static void disposeView(long viewId) {
         mainHandler.post(() -> {
-            FrameLayout container = containers.get(viewId);
-            if (container != null) {
-                if (rootContainer != null) {
-                    rootContainer.removeView(container);
-                }
-                container.removeAllViews();
-                containers.remove(viewId);
+            View view = views.remove(viewId);
+            FrameLayout container = containers.remove(viewId);
+            if (view instanceof WebView) {
+                ((WebView) view).destroy();
             }
-            views.remove(viewId);
+            if (container != null) {
+                detach(container);
+                container.removeAllViews();
+            }
+            contexts.remove(viewId);
+            hidden.remove(viewId);
+            clips.remove(viewId);
+            webStates.remove(viewId);
             Log.i(TAG, "View disposed: id=" + viewId);
         });
     }
 
-    /**
-     * Get the native View for a given platform view ID.
-     * Useful for packages that need direct access to the Android View.
-     */
+    /** The native View for a platform view ID, for packages that drive it directly. */
     public static View getView(long viewId) {
         return views.get(viewId);
     }
 
-    /**
-     * Get the container FrameLayout for a given platform view ID.
-     */
+    /** The container FrameLayout for a platform view ID. Main thread. */
     public static FrameLayout getContainer(long viewId) {
         return containers.get(viewId);
     }
 
-    /**
-     * Pause all platform views. Called when the app goes to background.
-     * Views are hidden to release rendering resources.
-     */
+    /** Hide all platform views (app in background); views hidden by setVisible stay hidden. */
     public static void pauseAll() {
         mainHandler.post(() -> {
             for (FrameLayout container : containers.values()) {
                 container.setVisibility(View.INVISIBLE);
             }
-            Log.i(TAG, "All platform views paused");
         });
     }
 
-    /**
-     * Resume all platform views. Called when the app returns to foreground.
-     * Views are made visible again.
-     */
+    /** Show the platform views hidden by {@link #pauseAll}. */
     public static void resumeAll() {
         mainHandler.post(() -> {
-            for (FrameLayout container : containers.values()) {
-                container.setVisibility(View.VISIBLE);
+            for (Map.Entry<Long, FrameLayout> entry : containers.entrySet()) {
+                boolean isHidden = Boolean.TRUE.equals(hidden.get(entry.getKey()));
+                entry.getValue().setVisibility(isHidden ? View.GONE : View.VISIBLE);
             }
-            Log.i(TAG, "All platform views resumed");
         });
     }
 
-    /**
-     * Dispose all platform views. Called during activity cleanup.
-     */
+    /** Dispose all platform views. */
     public static void disposeAll() {
         mainHandler.post(() -> {
-            for (FrameLayout container : containers.values()) {
-                if (rootContainer != null) {
-                    rootContainer.removeView(container);
-                }
-                container.removeAllViews();
+            for (Long id : containers.keySet().toArray(new Long[0])) {
+                disposeView(id);
             }
-            views.clear();
-            containers.clear();
-            Log.i(TAG, "All platform views disposed");
         });
     }
 
     /**
-     * Check if a touch point hits any visible platform view.
-     *
-     * Coordinates are in physical pixels relative to the window.
-     * This can be called from any thread (reads only from containers map
-     * on the calling thread, but note that container positions are set
-     * asynchronously on the UI thread, so there is a small race window).
-     *
-     * For the primary hit-test path, the Rust side uses its own
-     * PlatformViewRegistry.hit_test() which is synchronous and lock-free
-     * on the native thread. This Java method is provided as a convenience
-     * for Java-side callers.
-     *
-     * @param x Physical pixel x coordinate
-     * @param y Physical pixel y coordinate
-     * @return true if the point falls within a visible platform view
+     * Whether a point in physical pixels relative to the window falls inside a
+     * visible platform view. Main thread.
      */
     public static boolean hitTest(float x, float y) {
-        for (Map.Entry<Long, FrameLayout> entry : containers.entrySet()) {
-            FrameLayout container = entry.getValue();
+        for (FrameLayout container : containers.values()) {
             if (container.getVisibility() != View.VISIBLE) continue;
-
             int[] location = new int[2];
-            container.getLocationOnScreen(location);
-            int left = location[0];
-            int top = location[1];
-            int right = left + container.getWidth();
-            int bottom = top + container.getHeight();
-
-            if (x >= left && x <= right && y >= top && y <= bottom) {
+            container.getLocationInWindow(location);
+            if (x >= location[0] && x <= location[0] + container.getWidth()
+                    && y >= location[1] && y <= location[1] + container.getHeight()) {
                 return true;
             }
         }
@@ -413,47 +392,189 @@ public class GpuiPlatformView {
     }
 
     /**
-     * Dispatch a touch event to the platform view hierarchy.
+     * Dispatch a touch to the platform views, for hosts whose input doesn't go
+     * through the view hierarchy (NativeActivity).
      *
-     * Used to forward NativeActivity input events to platform views
-     * when the Rust-side hit-test determines the touch lands on a
-     * platform view. The event is posted to the UI thread for dispatch.
-     *
-     * @param x      Physical pixel x coordinate
-     * @param y      Physical pixel y coordinate
      * @param action MotionEvent action constant (0=DOWN, 1=UP, 2=MOVE)
      */
     public static void dispatchTouch(float x, float y, int action) {
         mainHandler.post(() -> {
             if (rootContainer == null) return;
-
             long now = android.os.SystemClock.uptimeMillis();
-            android.view.MotionEvent event = android.view.MotionEvent.obtain(
-                now, now, action, x, y, 0
-            );
+            android.view.MotionEvent event = android.view.MotionEvent.obtain(now, now, action, x, y, 0);
             rootContainer.dispatchTouchEvent(event);
             event.recycle();
         });
     }
 
-    /**
-     * Log the view hierarchy from a root view for debugging.
-     */
-    private static void logViewHierarchy(View view, int depth) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < depth; i++) sb.append("  ");
-        sb.append(view.getClass().getSimpleName());
-        sb.append(" [").append(view.getWidth()).append("x").append(view.getHeight()).append("]");
-        sb.append(" vis=").append(view.getVisibility() == View.VISIBLE ? "V" : view.getVisibility() == View.GONE ? "G" : "I");
-        if (view instanceof android.view.SurfaceView) {
-            sb.append(" (SurfaceView)");
-        }
-        Log.i(TAG, sb.toString());
-        if (view instanceof ViewGroup) {
-            ViewGroup vg = (ViewGroup) view;
-            for (int i = 0; i < vg.getChildCount(); i++) {
-                logViewHierarchy(vg.getChildAt(i), depth + 1);
+    // ── WebView ──────────────────────────────────────────────────────────
+
+    /** What a WebView reports, written on the main thread and read from any. */
+    static final class WebState {
+        volatile String url = "";
+        volatile String title = "";
+        volatile boolean loading;
+        volatile int progress;
+        volatile boolean canGoBack;
+        volatile boolean canGoForward;
+        volatile String error = "";
+    }
+
+    private static View createWebView(Context context, long viewId, Map<String, String> params) {
+        boolean jsEnabled = Boolean.parseBoolean(params.getOrDefault("javascript_enabled", "true"));
+        boolean domStorage = Boolean.parseBoolean(params.getOrDefault("dom_storage_enabled", "true"));
+        boolean zoom = Boolean.parseBoolean(params.getOrDefault("zoom_enabled", "true"));
+        String userAgent = params.getOrDefault("user_agent", "");
+        String url = params.getOrDefault("url", "");
+        String html = params.getOrDefault("html", "");
+
+        WebView wv = new WebView(context);
+        WebSettings settings = wv.getSettings();
+        settings.setJavaScriptEnabled(jsEnabled);
+        settings.setDomStorageEnabled(domStorage);
+        settings.setBuiltInZoomControls(zoom);
+        settings.setSupportZoom(zoom);
+        if (zoom) settings.setDisplayZoomControls(false);
+        settings.setLoadWithOverviewMode(true);
+        settings.setUseWideViewPort(true);
+        if (!userAgent.isEmpty()) settings.setUserAgentString(userAgent);
+
+        WebState state = new WebState();
+        webStates.put(viewId, state);
+        wv.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageStarted(WebView view, String pageUrl, Bitmap favicon) {
+                state.loading = true;
+                state.error = "";
+                update(view, state);
             }
+
+            @Override
+            public void onPageFinished(WebView view, String pageUrl) {
+                state.loading = false;
+                update(view, state);
+            }
+
+            @Override
+            public void doUpdateVisitedHistory(WebView view, String pageUrl, boolean isReload) {
+                update(view, state);
+            }
+
+            @Override
+            public void onReceivedError(WebView view, android.webkit.WebResourceRequest request,
+                    android.webkit.WebResourceError error) {
+                if (request.isForMainFrame()) {
+                    state.error = error.getErrorCode() + " " + error.getDescription();
+                }
+            }
+        });
+        wv.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onProgressChanged(WebView view, int progress) {
+                state.progress = progress;
+            }
+
+            @Override
+            public void onReceivedTitle(WebView view, String title) {
+                state.title = title == null ? "" : title;
+            }
+        });
+
+        if (!html.isEmpty()) {
+            wv.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null);
+        } else if (!url.isEmpty()) {
+            wv.loadUrl(url);
+        }
+        return wv;
+    }
+
+    private static void update(WebView view, WebState state) {
+        String url = view.getUrl();
+        state.url = url == null ? "" : url;
+        String title = view.getTitle();
+        if (title != null) state.title = title;
+        state.canGoBack = view.canGoBack();
+        state.canGoForward = view.canGoForward();
+    }
+
+    /** Run {@code action} on the main thread with the WebView of {@code viewId}, if there is one. */
+    private static void withWebView(long viewId, java.util.function.Consumer<WebView> action) {
+        mainHandler.post(() -> {
+            View view = views.get(viewId);
+            if (view instanceof WebView) {
+                action.accept((WebView) view);
+            } else {
+                Log.w(TAG, "No WebView with id=" + viewId);
+            }
+        });
+    }
+
+    public static void webViewLoadUrl(long viewId, String url) {
+        withWebView(viewId, wv -> wv.loadUrl(url));
+    }
+
+    public static void webViewLoadHtml(long viewId, String html) {
+        withWebView(viewId, wv -> wv.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null));
+    }
+
+    public static void webViewGoBack(long viewId) {
+        withWebView(viewId, wv -> { if (wv.canGoBack()) wv.goBack(); });
+    }
+
+    public static void webViewGoForward(long viewId) {
+        withWebView(viewId, wv -> { if (wv.canGoForward()) wv.goForward(); });
+    }
+
+    public static void webViewReload(long viewId) {
+        withWebView(viewId, WebView::reload);
+    }
+
+    public static void webViewStopLoading(long viewId) {
+        withWebView(viewId, WebView::stopLoading);
+    }
+
+    /**
+     * Evaluate {@code script} in the page. With a nonzero {@code requestId}, the result
+     * (JSON, as WebView reports it) or an error comes back through
+     * {@link #nativeJavascriptResult}, which gpui-mobile registers.
+     */
+    public static void webViewEvaluateJavascript(long viewId, String script, long requestId) {
+        mainHandler.post(() -> {
+            View view = views.get(viewId);
+            if (!(view instanceof WebView)) {
+                deliverJavascriptResult(requestId, null, "No WebView with id=" + viewId);
+                return;
+            }
+            ((WebView) view).evaluateJavascript(script, value -> deliverJavascriptResult(requestId, value, null));
+        });
+    }
+
+    private static void deliverJavascriptResult(long requestId, String value, String error) {
+        if (requestId == 0) return;
+        try {
+            nativeJavascriptResult(requestId, value, error);
+        } catch (UnsatisfiedLinkError e) {
+            Log.w(TAG, "JavaScript result dropped: native callback not registered");
         }
     }
+
+    /**
+     * The WebView's state: {url, title, loading, progress, canGoBack, canGoForward, error},
+     * or null if there is no WebView with that ID. Any thread.
+     */
+    public static String[] webViewState(long viewId) {
+        WebState state = webStates.get(viewId);
+        if (state == null) return null;
+        return new String[] {
+            state.url,
+            state.title,
+            state.loading ? "1" : "0",
+            Integer.toString(state.progress),
+            state.canGoBack ? "1" : "0",
+            state.canGoForward ? "1" : "0",
+            state.error,
+        };
+    }
+
+    private static native void nativeJavascriptResult(long requestId, String value, String error);
 }

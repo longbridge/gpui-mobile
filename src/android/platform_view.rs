@@ -1,8 +1,10 @@
 //! Android platform view implementation.
 //!
 //! Embeds native Android `View` instances in the GPUI render tree using
-//! hybrid composition. Native views are added to the NativeActivity's
-//! content view hierarchy and positioned to match GPUI element bounds.
+//! hybrid composition. Native views are added on top of the Activity's
+//! content and positioned to match GPUI element bounds. The Java side
+//! (`GpuiPlatformView`) moves them to a recreated Activity: see
+//! [`attach_to_activity`].
 
 use crate::platform_view::{
     PlatformView, PlatformViewBounds, PlatformViewFactory, PlatformViewId, PlatformViewParams,
@@ -23,6 +25,16 @@ pub struct AndroidPlatformView {
     java_view_ref: std::sync::atomic::AtomicUsize,
     disposed: AtomicBool,
     bounds: std::sync::Mutex<PlatformViewBounds>,
+    /// What was last sent to Java, so a GPUI frame that changes nothing makes no
+    /// JNI call and posts nothing to the UI thread.
+    sent: std::sync::Mutex<Sent>,
+}
+
+#[derive(Default)]
+struct Sent {
+    bounds: Option<PlatformViewBounds>,
+    clip: Option<Option<PlatformViewBounds>>,
+    visible: Option<bool>,
 }
 
 impl AndroidPlatformView {
@@ -39,6 +51,11 @@ impl AndroidPlatformView {
             java_view_ref: std::sync::atomic::AtomicUsize::new(0),
             disposed: AtomicBool::new(false),
             bounds: std::sync::Mutex::new(params.bounds),
+            sent: std::sync::Mutex::new(Sent {
+                bounds: Some(params.bounds),
+                clip: Some(None),
+                visible: Some(true),
+            }),
         };
 
         // Create the native Android view via JNI
@@ -64,11 +81,12 @@ impl AndroidPlatformView {
             let height = bounds.height;
             drop(bounds);
 
-            // Serialize creation_params as "key1=value1|key2=value2"
+            // "key1=value1|key2=value2", with `%` and `|` escaped so values (HTML,
+            // URLs) may contain them.
             let creation_params_str: String = params
                 .creation_params
                 .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
+                .map(|(k, v)| format!("{}={}", escape_param(k), escape_param(v)))
                 .collect::<Vec<_>>()
                 .join("|");
             let creation_params_jstr = env.new_string(&creation_params_str).e()?;
@@ -202,6 +220,9 @@ impl PlatformView for AndroidPlatformView {
             return;
         }
         *self.bounds.lock().unwrap() = bounds;
+        if self.sent.lock().unwrap().bounds.replace(bounds) == Some(bounds) {
+            return;
+        }
         self.update_native_bounds(&bounds);
     }
 
@@ -209,7 +230,51 @@ impl PlatformView for AndroidPlatformView {
         if self.disposed.load(Ordering::Relaxed) {
             return;
         }
+        if self.sent.lock().unwrap().visible.replace(visible) == Some(visible) {
+            return;
+        }
         self.update_native_visibility(visible);
+    }
+
+    fn set_clip(&self, clip: Option<PlatformViewBounds>) {
+        if self.disposed.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.sent.lock().unwrap().clip.replace(clip) == Some(clip) {
+            return;
+        }
+        use super::jni::{find_app_class, with_env};
+        use jni::objects::JValue;
+
+        let rect = clip.unwrap_or(PlatformViewBounds {
+            x: 0.0,
+            y: 0.0,
+            width: -1.0,
+            height: -1.0,
+        });
+        let view_id = self.id.0 as i64;
+        if let Err(err) = with_env(|env| {
+            let helper_class = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView")?;
+            env.call_static_method(
+                &helper_class,
+                jni::jni_str!("setClip"),
+                jni::jni_sig!("(JFFFF)V"),
+                &[
+                    JValue::Long(view_id),
+                    JValue::Float(rect.x),
+                    JValue::Float(rect.y),
+                    JValue::Float(rect.width),
+                    JValue::Float(rect.height),
+                ],
+            )
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+            Ok(())
+        }) {
+            log::warn!("AndroidPlatformView: setClip: {err}");
+        }
     }
 
     fn set_z_index(&self, z_index: i32) {
@@ -250,6 +315,11 @@ impl PlatformView for AndroidPlatformView {
     }
 }
 
+/// Escape a creation parameter for `GpuiPlatformView.parseCreationParams`.
+fn escape_param(value: &str) -> String {
+    value.replace('%', "%25").replace('|', "%7C")
+}
+
 /// Generic Android platform view factory.
 ///
 /// Delegates view creation to the Java-side `GpuiPlatformView` helper,
@@ -274,5 +344,38 @@ impl PlatformViewFactory for AndroidPlatformViewFactory {
 
     fn view_type(&self) -> &str {
         &self.view_type
+    }
+}
+
+/// Make `activity` the host of every platform view: `GpuiPlatformView` moves the
+/// existing ones into it. [`crate::android::host::set_activity`] calls this, so a
+/// recreated Activity keeps its maps, web views, camera previews and videos.
+///
+/// Apps that don't ship the `GpuiPlatformView` helper have no platform views;
+/// for them this does nothing.
+pub(crate) fn attach_to_activity(env: &mut jni::Env<'_>, activity: &jni::objects::JObject<'_>) {
+    use super::jni::find_app_class;
+    use jni::objects::JValue;
+
+    let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView") else {
+        if env.exception_check() {
+            env.exception_clear();
+        }
+        return;
+    };
+    if let Err(err) = env
+        .call_static_method(
+            &helper_class,
+            jni::jni_str!("attachToActivity"),
+            jni::jni_sig!("(Landroid/app/Activity;)V"),
+            &[JValue::Object(activity)],
+        )
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })
+    {
+        // An app with an older copy of the helper.
+        log::debug!("GpuiPlatformView.attachToActivity: {err}");
     }
 }
