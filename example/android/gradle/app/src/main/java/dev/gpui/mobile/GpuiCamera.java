@@ -10,7 +10,6 @@ import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
 import android.media.MediaRecorder;
-import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Size;
@@ -66,7 +65,7 @@ public final class GpuiCamera {
     static class CameraSession {
         String cameraId;
         CameraDevice device;
-        CameraCaptureSession captureSession;
+        volatile CameraCaptureSession captureSession;
         CaptureRequest.Builder previewRequestBuilder;
         ImageReader imageReader;
         ImageReader photoReader;
@@ -74,15 +73,22 @@ public final class GpuiCamera {
         HandlerThread backgroundThread;
         Handler backgroundHandler;
         TextureView textureView;
-        Surface previewSurface;
+        volatile Surface previewSurface;
         Size previewSize;
         boolean enableAudio;
         int flashMode = FLASH_OFF;
         String videoPath;
         boolean isRecording;
         float maxZoom = 1.0f;
+        int sensorOrientation;
+        boolean frontFacing;
+        /** Application context: where photos and videos go, and the display rotation. */
+        Context appContext;
         final Semaphore openLock = new Semaphore(1);
     }
+
+    private static final android.os.Handler sMainHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
 
     // ── Public API ───────────────────────────────────────────────────────
 
@@ -123,6 +129,7 @@ public final class GpuiCamera {
             CameraSession session = new CameraSession();
             session.cameraId = cameraId;
             session.enableAudio = enableAudio;
+            session.appContext = activity.getApplicationContext();
 
             // Start background thread
             session.backgroundThread = new HandlerThread("CameraBackground");
@@ -132,6 +139,11 @@ public final class GpuiCamera {
             // Get camera characteristics
             CameraManager manager = (CameraManager) activity.getSystemService(Context.CAMERA_SERVICE);
             CameraCharacteristics chars = manager.getCameraCharacteristics(cameraId);
+
+            Integer sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION);
+            session.sensorOrientation = sensorOrientation != null ? sensorOrientation : 90;
+            Integer facing = chars.get(CameraCharacteristics.LENS_FACING);
+            session.frontFacing = facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT;
 
             // Get max zoom
             Float maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
@@ -277,12 +289,15 @@ public final class GpuiCamera {
                 session.captureSession.close();
                 session.captureSession = null;
             }
-            if (session.textureView != null) {
-                ViewGroup parent = (ViewGroup) session.textureView.getParent();
-                if (parent != null) {
-                    parent.removeView(session.textureView);
-                }
-                session.textureView = null;
+            TextureView tv = session.textureView;
+            session.textureView = null;
+            // Views belong to the main thread. A preview made by createPreviewSurface is
+            // removed with its platform view; this covers startPreview's own TextureView.
+            if (tv != null && !isPlatformViewPreview(tv)) {
+                sMainHandler.post(() -> {
+                    ViewGroup parent = (ViewGroup) tv.getParent();
+                    if (parent != null) parent.removeView(tv);
+                });
             }
         } catch (Exception e) {
             android.util.Log.e(TAG, "stopPreview failed", e);
@@ -312,13 +327,13 @@ public final class GpuiCamera {
                         byte[] bytes = new byte[buffer.remaining()];
                         buffer.get(bytes);
 
-                        String fileName = "photo_" + UUID.randomUUID().toString() + ".jpg";
-                        File file = new File(Environment.getExternalStoragePublicDirectory(
-                                Environment.DIRECTORY_PICTURES), fileName);
-                        // Fallback to cache dir
-                        if (!file.getParentFile().exists()) {
-                            file = new File(System.getProperty("java.io.tmpdir"), fileName);
+                        // App-private cache: no storage permission, and nothing written to
+                        // shared storage behind the user's back. Callers move it if they keep it.
+                        File dir = new File(session.appContext.getCacheDir(), "camera");
+                        if (!dir.isDirectory() && !dir.mkdirs()) {
+                            throw new IOException("Cannot create " + dir);
                         }
+                        File file = new File(dir, "photo_" + UUID.randomUUID().toString() + ".jpg");
 
                         try (FileOutputStream fos = new FileOutputStream(file)) {
                             fos.write(bytes);
@@ -339,6 +354,7 @@ public final class GpuiCamera {
             captureBuilder.addTarget(session.photoReader.getSurface());
             captureBuilder.set(CaptureRequest.CONTROL_AF_MODE,
                     CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation(session));
             applyFlashMode(captureBuilder, session.flashMode);
 
             session.captureSession.capture(captureBuilder.build(),
@@ -364,8 +380,11 @@ public final class GpuiCamera {
         if (session == null || session.device == null || session.isRecording) return;
 
         try {
-            String fileName = "video_" + UUID.randomUUID().toString() + ".mp4";
-            File file = new File(System.getProperty("java.io.tmpdir"), fileName);
+            File dir = new File(session.appContext.getCacheDir(), "camera");
+            if (!dir.isDirectory() && !dir.mkdirs()) {
+                throw new IOException("Cannot create " + dir);
+            }
+            File file = new File(dir, "video_" + UUID.randomUUID().toString() + ".mp4");
             session.videoPath = file.getAbsolutePath();
 
             session.mediaRecorder = new MediaRecorder();
@@ -380,6 +399,7 @@ public final class GpuiCamera {
             }
             session.mediaRecorder.setVideoSize(session.previewSize.getWidth(), session.previewSize.getHeight());
             session.mediaRecorder.setVideoFrameRate(30);
+            session.mediaRecorder.setOrientationHint(jpegOrientation(session));
             session.mediaRecorder.setOutputFile(session.videoPath);
             session.mediaRecorder.prepare();
 
@@ -594,6 +614,7 @@ public final class GpuiCamera {
     // ── Internal helpers ─────────────────────────────────────────────────
 
     private static void createCaptureSession(CameraSession session) {
+        if (session.previewSurface == null || session.device == null) return;
         try {
             List<Surface> surfaces = new ArrayList<>();
             surfaces.add(session.previewSurface);
@@ -675,12 +696,15 @@ public final class GpuiCamera {
     /**
      * Create a TextureView for camera preview.
      *
-     * <p>The TextureView is wired to the CameraSession. When the surface
-     * becomes available, a capture session is created automatically.
-     * The view is NOT added to the hierarchy — the caller (GpuiPlatformView) handles that.</p>
+     * <p>The capture session starts when the TextureView's surface becomes available
+     * and stops when it is destroyed, so the preview follows the view: detached from
+     * a destroyed Activity and attached to its replacement, it restarts. The preview
+     * fills the view, cropped, upright in any display rotation.</p>
      *
-     * @param context   The view context (the platform view host's, which follows Activity recreation).
-     * @param handleId  Camera session handle ID.
+     * <p>The view is NOT added to the hierarchy — the caller (GpuiPlatformView) handles that.</p>
+     *
+     * @param context  The view context.
+     * @param handleId Camera session handle ID.
      * @return A configured TextureView, or an empty FrameLayout if the session is not found.
      */
     public static android.view.View createPreviewSurface(Context context, int handleId) {
@@ -690,45 +714,117 @@ public final class GpuiCamera {
         }
         if (session == null || session.device == null) {
             android.util.Log.w(TAG, "createPreviewSurface: session " + handleId + " not found");
-            return new android.widget.FrameLayout(context);
+            return new FrameLayout(context);
         }
 
         final CameraSession s = session;
-        android.view.TextureView tv = new android.view.TextureView(context);
+        TextureView tv = new TextureView(context);
+        tv.setTag(PREVIEW_TAG);
         s.textureView = tv;
 
-        tv.setSurfaceTextureListener(new android.view.TextureView.SurfaceTextureListener() {
+        tv.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
             @Override
-            public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture surface, int width, int height) {
+            public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
+                if (s.device == null) return;
                 surface.setDefaultBufferSize(s.previewSize.getWidth(), s.previewSize.getHeight());
-                s.previewSurface = new android.view.Surface(surface);
+                s.previewSurface = new Surface(surface);
+                configureTransform(tv, s, width, height);
                 createCaptureSession(s);
             }
 
             @Override
-            public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture surface, int w, int h) {}
+            public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int w, int h) {
+                configureTransform(tv, s, w, h);
+            }
 
             @Override
-            public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture surface) {
+            public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) {
+                // Detached (disposed, or its Activity went away): stop sending frames to it.
+                CameraCaptureSession capture = s.captureSession;
+                s.captureSession = null;
+                if (capture != null) {
+                    try {
+                        capture.close();
+                    } catch (Exception e) {
+                        android.util.Log.w(TAG, "closing the preview session failed", e);
+                    }
+                }
+                Surface old = s.previewSurface;
+                s.previewSurface = null;
+                if (old != null) old.release();
                 return true;
             }
 
             @Override
-            public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture surface) {}
+            public void onSurfaceTextureUpdated(SurfaceTexture surface) {}
         });
-
-        // If texture is already available
-        if (tv.isAvailable()) {
-            android.graphics.SurfaceTexture st = tv.getSurfaceTexture();
-            st.setDefaultBufferSize(s.previewSize.getWidth(), s.previewSize.getHeight());
-            s.previewSurface = new android.view.Surface(st);
-            createCaptureSession(s);
-        }
-
-        // Start the session running
-        // (capture session creation is async via the SurfaceTextureListener)
-
+        // Display rotation changes without a size change (180 degrees) need a new transform.
+        tv.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) ->
+                configureTransform(tv, s, r - l, b - t));
         return tv;
+    }
+
+    private static final String PREVIEW_TAG = "gpui-camera-preview";
+
+    private static boolean isPlatformViewPreview(TextureView tv) {
+        return PREVIEW_TAG.equals(tv.getTag());
+    }
+
+    private static int displayRotationDegrees(Context context) {
+        android.view.WindowManager wm =
+                (android.view.WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
+        switch (wm.getDefaultDisplay().getRotation()) {
+            case Surface.ROTATION_90: return 90;
+            case Surface.ROTATION_180: return 180;
+            case Surface.ROTATION_270: return 270;
+            default: return 0;
+        }
+    }
+
+    /** Clockwise rotation that makes the sensor's image upright for the current display rotation. */
+    private static int jpegOrientation(CameraSession s) {
+        int device = (360 - displayRotationDegrees(s.appContext)) % 360;
+        if (s.frontFacing) device = -device;
+        return (s.sensorOrientation + device + 360) % 360;
+    }
+
+    /**
+     * Fill the view with the preview, keeping its aspect ratio (center crop). The
+     * camera's buffer is landscape; the TextureView already turns it upright for the
+     * device's natural orientation, so only other display rotations rotate here.
+     */
+    private static void configureTransform(TextureView tv, CameraSession s, int viewWidth, int viewHeight) {
+        if (s.previewSize == null || viewWidth == 0 || viewHeight == 0) return;
+        int rotation = displayRotationDegrees(tv.getContext());
+        android.graphics.Matrix matrix = new android.graphics.Matrix();
+        float cx = viewWidth / 2f;
+        float cy = viewHeight / 2f;
+        float bufferWidth = s.previewSize.getWidth();
+        float bufferHeight = s.previewSize.getHeight();
+        if (rotation == 90 || rotation == 270) {
+            android.graphics.RectF viewRect = new android.graphics.RectF(0, 0, viewWidth, viewHeight);
+            android.graphics.RectF bufferRect = new android.graphics.RectF(0, 0, bufferHeight, bufferWidth);
+            bufferRect.offset(cx - bufferRect.centerX(), cy - bufferRect.centerY());
+            matrix.setRectToRect(viewRect, bufferRect, android.graphics.Matrix.ScaleToFit.FILL);
+            float scale = Math.max(viewHeight / bufferHeight, viewWidth / bufferWidth);
+            matrix.postScale(scale, scale, cx, cy);
+            matrix.postRotate(rotation == 90 ? -90 : 90, cx, cy);
+        } else {
+            // Upright content is the buffer turned a quarter (portrait-mounted sensors).
+            boolean quarter = s.sensorOrientation % 180 != 0;
+            float contentAspect = quarter ? bufferHeight / bufferWidth : bufferWidth / bufferHeight;
+            float viewAspect = (float) viewWidth / viewHeight;
+            float sx = 1f;
+            float sy = 1f;
+            if (viewAspect > contentAspect) {
+                sy = viewAspect / contentAspect;
+            } else {
+                sx = contentAspect / viewAspect;
+            }
+            matrix.setScale(sx, sy, cx, cy);
+            if (rotation == 180) matrix.postRotate(180, cx, cy);
+        }
+        tv.setTransform(matrix);
     }
 
     private GpuiCamera() {}
