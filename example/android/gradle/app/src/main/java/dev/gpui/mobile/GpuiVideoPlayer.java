@@ -459,22 +459,22 @@ public final class GpuiVideoPlayer {
      * <p>The view is NOT added to the hierarchy — the caller
      * (GpuiPlatformView) handles that.</p>
      *
-     * @param activity The current Activity.
+     * @param context  The view context (the platform view host's, which follows Activity recreation).
      * @param id       Player ID.
      * @return A configured SurfaceView, or an empty FrameLayout if the player is not found.
      */
-    public static android.view.View createVideoSurface(Activity activity, int id) {
+    public static android.view.View createVideoSurface(android.content.Context context, int id) {
         MediaPlayer mp;
         synchronized (sLock) {
             mp = sPlayers.get(id);
         }
         if (mp == null) {
             android.util.Log.w(TAG, "createVideoSurface: player " + id + " not found");
-            return new FrameLayout(activity);
+            return new FrameLayout(context);
         }
 
         final MediaPlayer fmp = mp;
-        SurfaceView sv = new SurfaceView(activity);
+        SurfaceView sv = new SurfaceView(context);
         // Render above NativeActivity's own SurfaceView.
         sv.setZOrderOnTop(true);
 

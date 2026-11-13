@@ -18,36 +18,135 @@
 //! ```
 
 use crate::platform_view::{PlatformViewBounds, PlatformViewHandle};
-use gpui::{div, ParentElement, Styled};
-use std::sync::Arc;
+use gpui::{
+    div, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, Pixels, Refineable as _, Style, StyleRefinement, Styled, Window,
+};
+use std::sync::{Arc, Weak};
 
 /// Create a GPUI element that hosts a native platform view.
 ///
-/// The element reserves layout space and updates the platform view's
-/// position and size on every paint. The native view is shown when
-/// painted and hidden when the element is removed from the tree.
+/// The element reserves layout space and, when painted, moves the native view
+/// to its bounds and clips it to the visible area of its scroll containers
+/// (native views draw above GPUI content). When the element stops being painted
+/// (its screen closes, a tab switches away) the native view is hidden, and shown
+/// again when it comes back. [`PlatformViewHandle::set_visible`] still hides it
+/// on request, for instance under a GPUI dialog.
 ///
-/// The returned element can be styled with `.w()`, `.h()`, `.size()`,
-/// `.flex_grow(1.)`, etc. to control how much space it occupies in the layout.
-pub fn platform_view_element(handle: Arc<PlatformViewHandle>) -> gpui::Div {
-    div().child(
-        gpui::canvas(
-            // Prepaint: capture bounds
-            move |bounds, _window, _cx| bounds,
-            // Paint: synchronize native view position
-            move |_bounds, prepaint_bounds, _window, _cx| {
-                let logical_bounds = PlatformViewBounds {
-                    x: prepaint_bounds.origin.x.as_f32(),
-                    y: prepaint_bounds.origin.y.as_f32(),
-                    width: prepaint_bounds.size.width.as_f32(),
-                    height: prepaint_bounds.size.height.as_f32(),
-                };
-                handle.set_bounds(logical_bounds);
-                handle.set_visible(true);
-            },
-        )
-        .size_full(),
-    )
+/// Size it like any element: `.w()`, `.h()`, `.size_full()`, `.flex_grow()`.
+pub fn platform_view_element(handle: Arc<PlatformViewHandle>) -> PlatformViewElement {
+    PlatformViewElement {
+        handle,
+        style: StyleRefinement::default(),
+    }
+}
+
+/// The element returned by [`platform_view_element`].
+pub struct PlatformViewElement {
+    handle: Arc<PlatformViewHandle>,
+    style: StyleRefinement,
+}
+
+impl Styled for PlatformViewElement {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+impl IntoElement for PlatformViewElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// Kept in the element's state while it is painted; GPUI drops the state of an
+/// element that wasn't painted in a frame, which hides the view.
+struct OnScreen(Weak<PlatformViewHandle>);
+
+impl Drop for OnScreen {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.upgrade() {
+            handle.set_on_screen(false);
+        }
+    }
+}
+
+fn logical(bounds: Bounds<Pixels>) -> PlatformViewBounds {
+    PlatformViewBounds {
+        x: bounds.origin.x.as_f32(),
+        y: bounds.origin.y.as_f32(),
+        width: bounds.size.width.as_f32(),
+        height: bounds.size.height.as_f32(),
+    }
+}
+
+impl Element for PlatformViewElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some(ElementId::NamedInteger(
+            "platform-view".into(),
+            self.handle.id().0,
+        ))
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.refine(&self.style);
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
+        let handle = &self.handle;
+        let visible = bounds.intersect(&window.content_mask().bounds);
+        let on_screen = visible.size.width > Pixels::ZERO && visible.size.height > Pixels::ZERO;
+        if on_screen {
+            handle.set_bounds(logical(bounds));
+            handle.set_clip((visible != bounds).then(|| logical(visible)));
+        }
+        handle.set_on_screen(on_screen);
+        if let Some(id) = id {
+            window.with_element_state(id, |state: Option<OnScreen>, _| {
+                (
+                    (),
+                    state.unwrap_or_else(|| OnScreen(Arc::downgrade(handle))),
+                )
+            });
+        }
+    }
 }
 
 /// A higher-level wrapper that creates the platform view from the registry
@@ -98,15 +197,14 @@ impl ManagedPlatformView {
         self.handle.as_ref()
     }
 
-    /// Render the platform view element.
-    ///
-    /// Returns a div with an error message if the view fails to create.
-    pub fn render(&mut self) -> gpui::Div {
+    /// Render the platform view element, or an empty element if the view
+    /// fails to create.
+    pub fn render(&mut self) -> gpui::AnyElement {
         match self.ensure_created() {
-            Ok(handle) => platform_view_element(handle),
+            Ok(handle) => platform_view_element(handle).into_any_element(),
             Err(e) => {
                 log::error!("Failed to create platform view '{}': {}", self.view_type, e);
-                div()
+                div().into_any_element()
             }
         }
     }
