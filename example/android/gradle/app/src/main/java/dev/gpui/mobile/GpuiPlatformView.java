@@ -41,9 +41,32 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>Every method may be called from any thread; work on views is posted to the
  * main thread in call order.</p>
  *
- * View types: "container", "video_player", "webview", "camera_preview", "map".
+ * View types: "container", "video_player", "webview", "camera_preview", "map", and
+ * any an app adds with {@link #registerViewType}.
  */
 public class GpuiPlatformView {
+    /** Builds the native view for a view type an app registers (a map SDK's view, say). */
+    public interface ViewFactory {
+        /**
+         * @param context  the view context; it follows Activity recreation
+         * @param viewId   the platform view's ID, as Rust's PlatformViewHandle::id reports it
+         * @param params   the creation params Rust passed
+         */
+        View create(Context context, long viewId, Map<String, String> params);
+    }
+
+    private static final Map<String, ViewFactory> factories = new ConcurrentHashMap<>();
+
+    /**
+     * Build views of {@code viewType} with {@code factory}, replacing a built-in type
+     * of the same name. Call it before Rust creates such a view, e.g. in onCreate.
+     * Rust creates them through an AndroidPlatformViewFactory for the same type; find
+     * the view later with {@link #getView}.
+     */
+    public static void registerViewType(String viewType, ViewFactory factory) {
+        factories.put(viewType, factory);
+    }
+
     private static final String TAG = "GpuiPlatformView";
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
 
@@ -195,6 +218,10 @@ public class GpuiPlatformView {
 
     private static View createViewForType(
             Context context, String viewType, long viewId, Map<String, String> params) {
+        ViewFactory factory = factories.get(viewType);
+        if (factory != null) {
+            return factory.create(context, viewId, params);
+        }
         switch (viewType) {
             case "container":
                 FrameLayout frame = new FrameLayout(context);
@@ -207,10 +234,7 @@ public class GpuiPlatformView {
             case "camera_preview":
                 return GpuiCamera.createPreviewSurface(context, parseInt(params.get("session_id")));
             case "map":
-                // Placeholder — MapView requires Google Play Services SDK
-                FrameLayout mapContainer = new FrameLayout(context);
-                mapContainer.setBackgroundColor(0xFFE0E0E0);
-                return mapContainer;
+                return new GpuiMapView(context, params);
             default:
                 Log.w(TAG, "Unknown view type: " + viewType + ", creating empty container");
                 return new FrameLayout(context);
