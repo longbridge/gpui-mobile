@@ -3,6 +3,7 @@ package dev.gpui.mobile;
 import android.app.Activity;
 import android.content.Context;
 import android.content.MutableContextWrapper;
+import android.graphics.Bitmap;
 import android.graphics.Rect;
 import android.os.Handler;
 import android.os.Looper;
@@ -46,13 +47,14 @@ public class GpuiPlatformView {
     private static final String TAG = "GpuiPlatformView";
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
 
-    // Main thread only, except getView/getContainer reads.
+    // Main thread only, except getView/getContainer/web state reads.
     private static final Map<Long, View> views = new ConcurrentHashMap<>();
     private static final Map<Long, FrameLayout> containers = new LinkedHashMap<>();
     private static final Map<Long, MutableContextWrapper> contexts = new HashMap<>();
     private static final Map<Long, Boolean> hidden = new HashMap<>();
     /** Clip rectangles in logical window coordinates {x, y, width, height}. */
     private static final Map<Long, float[]> clips = new HashMap<>();
+    private static final Map<Long, WebState> webStates = new ConcurrentHashMap<>();
 
     /** The root FrameLayout that hosts all platform views, in {@link #currentActivity}. */
     private static FrameLayout rootContainer;
@@ -201,7 +203,7 @@ public class GpuiPlatformView {
             case "video_player":
                 return GpuiVideoPlayer.createVideoSurface(context, parseInt(params.get("player_id")));
             case "webview":
-                return createWebView(context, params);
+                return createWebView(context, viewId, params);
             case "camera_preview":
                 return GpuiCamera.createPreviewSurface(context, parseInt(params.get("session_id")));
             case "map":
@@ -305,6 +307,7 @@ public class GpuiPlatformView {
             contexts.remove(viewId);
             hidden.remove(viewId);
             clips.remove(viewId);
+            webStates.remove(viewId);
             Log.i(TAG, "View disposed: id=" + viewId);
         });
     }
@@ -382,10 +385,22 @@ public class GpuiPlatformView {
 
     // ── WebView ──────────────────────────────────────────────────────────
 
-    private static View createWebView(Context context, Map<String, String> params) {
+    /** What a WebView reports, written on the main thread and read from any. */
+    static final class WebState {
+        volatile String url = "";
+        volatile String title = "";
+        volatile boolean loading;
+        volatile int progress;
+        volatile boolean canGoBack;
+        volatile boolean canGoForward;
+        volatile String error = "";
+    }
+
+    private static View createWebView(Context context, long viewId, Map<String, String> params) {
         boolean jsEnabled = Boolean.parseBoolean(params.getOrDefault("javascript_enabled", "true"));
         boolean domStorage = Boolean.parseBoolean(params.getOrDefault("dom_storage_enabled", "true"));
         boolean zoom = Boolean.parseBoolean(params.getOrDefault("zoom_enabled", "true"));
+        String userAgent = params.getOrDefault("user_agent", "");
         String url = params.getOrDefault("url", "");
         String html = params.getOrDefault("html", "");
 
@@ -394,12 +409,52 @@ public class GpuiPlatformView {
         settings.setJavaScriptEnabled(jsEnabled);
         settings.setDomStorageEnabled(domStorage);
         settings.setBuiltInZoomControls(zoom);
+        settings.setSupportZoom(zoom);
         if (zoom) settings.setDisplayZoomControls(false);
         settings.setLoadWithOverviewMode(true);
         settings.setUseWideViewPort(true);
+        if (!userAgent.isEmpty()) settings.setUserAgentString(userAgent);
 
-        wv.setWebViewClient(new WebViewClient());
-        wv.setWebChromeClient(new WebChromeClient());
+        WebState state = new WebState();
+        webStates.put(viewId, state);
+        wv.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageStarted(WebView view, String pageUrl, Bitmap favicon) {
+                state.loading = true;
+                state.error = "";
+                update(view, state);
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String pageUrl) {
+                state.loading = false;
+                update(view, state);
+            }
+
+            @Override
+            public void doUpdateVisitedHistory(WebView view, String pageUrl, boolean isReload) {
+                update(view, state);
+            }
+
+            @Override
+            public void onReceivedError(WebView view, android.webkit.WebResourceRequest request,
+                    android.webkit.WebResourceError error) {
+                if (request.isForMainFrame()) {
+                    state.error = error.getErrorCode() + " " + error.getDescription();
+                }
+            }
+        });
+        wv.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onProgressChanged(WebView view, int progress) {
+                state.progress = progress;
+            }
+
+            @Override
+            public void onReceivedTitle(WebView view, String title) {
+                state.title = title == null ? "" : title;
+            }
+        });
 
         if (!html.isEmpty()) {
             wv.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null);
@@ -408,4 +463,94 @@ public class GpuiPlatformView {
         }
         return wv;
     }
+
+    private static void update(WebView view, WebState state) {
+        String url = view.getUrl();
+        state.url = url == null ? "" : url;
+        String title = view.getTitle();
+        if (title != null) state.title = title;
+        state.canGoBack = view.canGoBack();
+        state.canGoForward = view.canGoForward();
+    }
+
+    /** Run {@code action} on the main thread with the WebView of {@code viewId}, if there is one. */
+    private static void withWebView(long viewId, java.util.function.Consumer<WebView> action) {
+        mainHandler.post(() -> {
+            View view = views.get(viewId);
+            if (view instanceof WebView) {
+                action.accept((WebView) view);
+            } else {
+                Log.w(TAG, "No WebView with id=" + viewId);
+            }
+        });
+    }
+
+    public static void webViewLoadUrl(long viewId, String url) {
+        withWebView(viewId, wv -> wv.loadUrl(url));
+    }
+
+    public static void webViewLoadHtml(long viewId, String html) {
+        withWebView(viewId, wv -> wv.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null));
+    }
+
+    public static void webViewGoBack(long viewId) {
+        withWebView(viewId, wv -> { if (wv.canGoBack()) wv.goBack(); });
+    }
+
+    public static void webViewGoForward(long viewId) {
+        withWebView(viewId, wv -> { if (wv.canGoForward()) wv.goForward(); });
+    }
+
+    public static void webViewReload(long viewId) {
+        withWebView(viewId, WebView::reload);
+    }
+
+    public static void webViewStopLoading(long viewId) {
+        withWebView(viewId, WebView::stopLoading);
+    }
+
+    /**
+     * Evaluate {@code script} in the page. With a nonzero {@code requestId}, the result
+     * (JSON, as WebView reports it) or an error comes back through
+     * {@link #nativeJavascriptResult}, which gpui-mobile registers.
+     */
+    public static void webViewEvaluateJavascript(long viewId, String script, long requestId) {
+        mainHandler.post(() -> {
+            View view = views.get(viewId);
+            if (!(view instanceof WebView)) {
+                deliverJavascriptResult(requestId, null, "No WebView with id=" + viewId);
+                return;
+            }
+            ((WebView) view).evaluateJavascript(script, value -> deliverJavascriptResult(requestId, value, null));
+        });
+    }
+
+    private static void deliverJavascriptResult(long requestId, String value, String error) {
+        if (requestId == 0) return;
+        try {
+            nativeJavascriptResult(requestId, value, error);
+        } catch (UnsatisfiedLinkError e) {
+            Log.w(TAG, "JavaScript result dropped: native callback not registered");
+        }
+    }
+
+    /**
+     * The WebView's state: {url, title, loading, progress, canGoBack, canGoForward, error},
+     * or null if there is no WebView with that ID. Any thread.
+     */
+    public static String[] webViewState(long viewId) {
+        WebState state = webStates.get(viewId);
+        if (state == null) return null;
+        return new String[] {
+            state.url,
+            state.title,
+            state.loading ? "1" : "0",
+            Integer.toString(state.progress),
+            state.canGoBack ? "1" : "0",
+            state.canGoForward ? "1" : "0",
+            state.error,
+        };
+    }
+
+    private static native void nativeJavascriptResult(long requestId, String value, String error);
 }
