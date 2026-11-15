@@ -45,6 +45,12 @@
 //!    night mode until resumed.
 //! 4. From `onTouchEvent`, `dispatchKeyEvent` and the `InputConnection`:
 //!    [`motion_event`], [`key`], [`ime_event`].
+//! 5. Optionally, for predictive back: from an `OnBackAnimationCallback`
+//!    (Android 14+) or an `OnBackInvokedCallback` (13), [`back_event`]; and a
+//!    `gpuiSetBackEnabled(boolean)` method that registers that callback only while
+//!    the app has somewhere to go back to ([`set_back_enabled`]). A host without
+//!    these keeps sending `KEYCODE_BACK` through [`key`], which GPUI sees as
+//!    `escape`.
 //!
 //! The Activity must also expose the Java methods `jni.rs` calls back into for the IME
 //! (`gpuiShowKeyboard`, `gpuiHideKeyboard`, `gpuiResetComposition`); `GpuiInputActivity`
@@ -138,6 +144,7 @@ enum Command {
     /// render thread, so both go through the queue like everything else.
     Touch(TouchPoint),
     Key(AndroidKeyEvent),
+    Back(BackEvent),
 }
 
 /// `MotionEvent.getActionMasked()` values.
@@ -174,6 +181,66 @@ type OpenWindow = Arc<dyn Fn(HostId, &mut App) + Send + Sync>;
 /// after Back, the newest Activity ([`super::jni::activity_as_ptr`]) is the finishing
 /// one, not the one on screen.
 static ACTIVITIES: Mutex<BTreeMap<HostId, Global<JObject<'static>>>> = Mutex::new(BTreeMap::new());
+
+/// Back as the host reports it. See [`back_event`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BackEvent {
+    /// A predictive back gesture began (`OnBackAnimationCallback.onBackStarted`,
+    /// Android 14+). [`BackEvent::Progressed`] events follow, then
+    /// [`BackEvent::Cancelled`] or [`BackEvent::Invoked`].
+    Started(BackProgress),
+    /// The finger moved during a predictive back gesture.
+    Progressed(BackProgress),
+    /// The gesture was abandoned.
+    Cancelled,
+    /// Back was committed: the gesture finished, or the back button fired
+    /// (`OnBackInvokedCallback`, which Android 13 and three-button navigation
+    /// send alone, without a gesture before it).
+    Invoked,
+}
+
+/// Where a predictive back gesture is (`android.window.BackEvent`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BackProgress {
+    /// 0.0 when the gesture starts, 1.0 at the commit threshold, already eased by
+    /// the system.
+    pub progress: f32,
+    /// The touch, in physical pixels relative to the window.
+    pub x: f32,
+    pub y: f32,
+}
+
+impl BackEvent {
+    /// Build an event from the plain values a host's JNI entry point receives:
+    /// `kind` 0 started, 1 progressed, 2 cancelled, 3 invoked. `None` for an
+    /// unknown `kind`.
+    pub fn from_host(kind: i32, progress: f32, x: f32, y: f32) -> Option<Self> {
+        let at = BackProgress {
+            progress: progress.clamp(0.0, 1.0),
+            x,
+            y,
+        };
+        match kind {
+            0 => Some(Self::Started(at)),
+            1 => Some(Self::Progressed(at)),
+            2 => Some(Self::Cancelled),
+            3 => Some(Self::Invoked),
+            _ => None,
+        }
+    }
+}
+
+/// The back gesture GPUI is being given: where it started, and whether an
+/// element claimed it with `on_back_gesture`.
+#[derive(Clone, Copy, Debug)]
+struct BackGesture {
+    start: gpui::Point<gpui::Pixels>,
+    progress: f32,
+    claimed: bool,
+}
+
+/// The last value of [`set_back_enabled`], handed to Activities created later.
+static BACK_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Which backend a fresh GPU context is built on. See [`set_gpu_backend`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,6 +327,8 @@ struct HostApp {
     /// so at most one is attached at a time — which makes it the only sensible target
     /// for input and the only window worth drawing.
     attached: Option<HostId>,
+    /// The predictive back gesture in progress, if any.
+    back_gesture: Option<BackGesture>,
     /// Hosts whose window could not be opened or re-attached. Reported once as
     /// [`GpuOutcome::Failed`]; the host swaps that page for another UI, so its later
     /// surfaces (`surfaceChanged` follows `surfaceCreated`) are ignored rather than
@@ -337,6 +406,7 @@ fn render_thread(launch: Launch) {
         handle: None,
         windows: std::collections::HashMap::new(),
         attached: None,
+        back_gesture: None,
         failed: std::collections::HashSet::new(),
     };
 
@@ -429,6 +499,7 @@ fn render_thread(launch: Launch) {
                         win.handle_key_event(event);
                     }
                 }
+                Command::Back(event) => on_back_event(&mut app, event),
             }
         }
 
@@ -460,6 +531,83 @@ fn render_thread(launch: Launch) {
                 std::ptr::null_mut(),
             )
         };
+    }
+}
+
+/// Hand Back to GPUI as a [`gpui::BackGestureEvent`]: the element under the
+/// gesture's start that handles `on_back_gesture` claims it when it starts and
+/// gets the rest of it. A committed Back that nothing claimed reaches the window
+/// as the back key, which GPUI maps to `escape`, as if the host had sent
+/// `KEYCODE_BACK` through [`key`].
+fn on_back_event(app: &mut HostApp, event: BackEvent) {
+    use gpui::BackGesturePhase as Phase;
+
+    let Some(win) = attached_window(app) else {
+        app.back_gesture = None;
+        return;
+    };
+    let send = |phase, gesture: &BackGesture| {
+        win.handle_back_gesture(gpui::BackGestureEvent {
+            phase,
+            start_position: gesture.start,
+            progress: gesture.progress,
+        })
+    };
+    let scale = win.scale_factor();
+    let at = |p: BackProgress| BackGesture {
+        start: gpui::point(gpui::px(p.x / scale), gpui::px(p.y / scale)),
+        progress: p.progress,
+        claimed: false,
+    };
+    let gesture = match event {
+        BackEvent::Started(p) => {
+            let mut gesture = at(p);
+            gesture.claimed = send(Phase::Started, &gesture);
+            app.back_gesture = Some(gesture);
+            return;
+        }
+        BackEvent::Progressed(p) => {
+            if let Some(gesture) = app.back_gesture.as_mut().filter(|g| g.claimed) {
+                gesture.progress = p.progress;
+                send(Phase::Progressed, gesture);
+            }
+            return;
+        }
+        BackEvent::Cancelled => {
+            if let Some(gesture) = app.back_gesture.take().filter(|g| g.claimed) {
+                send(Phase::Cancelled, &gesture);
+            }
+            return;
+        }
+        BackEvent::Invoked => app.back_gesture.take().unwrap_or_else(|| {
+            // The back button, or Android 13: Back without a gesture before it.
+            // Offer it as a whole gesture from the leading edge.
+            let mut gesture = BackGesture {
+                start: gpui::point(gpui::px(0.0), gpui::px(win.logical_size().height.0 / 2.0)),
+                progress: 0.0,
+                claimed: false,
+            };
+            gesture.claimed = send(Phase::Started, &gesture);
+            gesture
+        }),
+    };
+    if gesture.claimed {
+        send(
+            Phase::Committed,
+            &BackGesture {
+                progress: 1.0,
+                ..gesture
+            },
+        );
+    } else {
+        for action in [0, 1] {
+            win.handle_key_event(AndroidKeyEvent {
+                key_code: super::keyboard::AKEYCODE_BACK,
+                action,
+                meta_state: 0,
+                unicode_char: 0,
+            });
+        }
     }
 }
 
@@ -596,6 +744,11 @@ pub fn set_activity(
     match env.new_global_ref(activity) {
         Ok(activity) => {
             ACTIVITIES.lock().expect("poisoned").insert(host, activity);
+            // A recreated Activity starts with its back callback unregistered.
+            if BACK_ENABLED.load(Ordering::SeqCst) {
+                let activity = activity_ref(env, host);
+                tell_back_enabled(env, activity, true);
+            }
             Ok(())
         }
         Err(err) => {
@@ -777,4 +930,83 @@ pub fn resumed(host: HostId) {
 
 pub fn paused(host: HostId) {
     post(Command::Paused { host });
+}
+
+/// Report Back from the host's `OnBackAnimationCallback` (Android 14+) or
+/// `OnBackInvokedCallback` (13, only [`BackEvent::Invoked`]). Call from the Java
+/// UI thread; the event is queued.
+///
+/// GPUI gets it as a [`gpui::BackGestureEvent`], so an element takes Back with
+/// `on_back_gesture`:
+///
+/// ```ignore
+/// div().size_full().on_back_gesture(cx.listener(|stack, event: &BackGestureEvent, _, cx| {
+///     match event.phase {
+///         // Follow the finger with `event.progress` (0.0 to 1.0).
+///         BackGesturePhase::Started | BackGesturePhase::Progressed => {}
+///         BackGesturePhase::Cancelled => {}
+///         BackGesturePhase::Committed => {
+///             stack.pop(cx);
+///             host::set_back_enabled(stack.len() > 1);
+///         }
+///     }
+/// }))
+/// ```
+///
+/// Back that no element claims arrives as `escape`, like `KEYCODE_BACK`.
+pub fn back_event(event: BackEvent) {
+    post(Command::Back(event));
+}
+
+/// Ask every host Activity to take Back (`true`) or leave it to the system
+/// (`false`), by calling its `gpuiSetBackEnabled(boolean)`. Android decides who
+/// gets a gesture before it starts, so call this as soon as the answer changes
+/// (a screen pushed, the last one popped), not when Back arrives. While it is
+/// `false`, the system runs its own Back (to the home screen, with its predictive
+/// animation). Activities created later get the latest value from
+/// [`set_activity`]. A host without the method is skipped.
+pub fn set_back_enabled(enabled: bool) {
+    if BACK_ENABLED.swap(enabled, Ordering::SeqCst) == enabled {
+        return;
+    }
+    let result = super::jni::with_env(|env| {
+        let activities: Vec<JObject<'_>> = {
+            let activities = ACTIVITIES.lock().expect("poisoned");
+            activities
+                .values()
+                .filter_map(|activity| env.new_local_ref(activity).ok())
+                .collect()
+        };
+        for activity in activities {
+            tell_back_enabled(env, Some(activity), enabled);
+        }
+        Ok(())
+    });
+    if let Err(err) = result {
+        log::warn!("set_back_enabled: {err}");
+    }
+}
+
+fn activity_ref<'local>(env: &mut jni::Env<'local>, host: HostId) -> Option<JObject<'local>> {
+    let activities = ACTIVITIES.lock().expect("poisoned");
+    env.new_local_ref(activities.get(&host)?).ok()
+}
+
+fn tell_back_enabled(env: &mut jni::Env<'_>, activity: Option<JObject<'_>>, enabled: bool) {
+    let Some(activity) = activity else {
+        return;
+    };
+    let result = env.call_method(
+        &activity,
+        jni::jni_str!("gpuiSetBackEnabled"),
+        jni::jni_sig!("(Z)V"),
+        &[jni::objects::JValue::Bool(enabled)],
+    );
+    if result.is_err() {
+        // Most likely NoSuchMethodError: a host that leaves Back to `key`.
+        if env.exception_check() {
+            env.exception_clear();
+        }
+        log::debug!("gpuiSetBackEnabled not available on this host");
+    }
 }
