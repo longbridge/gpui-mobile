@@ -257,6 +257,9 @@ pub type VisibilityCallback = Box<dyn FnMut(bool) + Send + 'static>;
 /// Called when a key event arrives.
 pub type KeyCallback = Box<dyn FnMut(AndroidKeyEvent) + Send + 'static>;
 
+/// Called for each phase of a back gesture; returns whether an element claimed it.
+pub type BackGestureCallback = Box<dyn FnMut(gpui::BackGestureEvent) -> bool + Send + 'static>;
+
 /// Called when the window is resized.
 pub type ResizeCallback = Box<dyn FnMut(Size<DevicePixels>, f32) + Send + 'static>;
 
@@ -372,6 +375,7 @@ struct WindowState {
     request_frame_callback: Option<RequestFrameCallback>,
     touch_callback: Option<TouchCallback>,
     key_callback: Option<KeyCallback>,
+    back_gesture_callback: Option<BackGestureCallback>,
     resize_callback: Option<ResizeCallback>,
     close_callback: Option<CloseCallback>,
     appearance_callback: Option<AppearanceCallback>,
@@ -481,6 +485,7 @@ impl AndroidWindow {
             request_frame_callback: None,
             touch_callback: None,
             key_callback: None,
+            back_gesture_callback: None,
             resize_callback: None,
             close_callback: None,
             appearance_callback: None,
@@ -517,6 +522,7 @@ impl AndroidWindow {
             request_frame_callback: None,
             touch_callback: None,
             key_callback: None,
+            back_gesture_callback: None,
             resize_callback: None,
             close_callback: None,
             appearance_callback: None,
@@ -930,6 +936,21 @@ impl AndroidWindow {
         }
     }
 
+    /// Deliver a phase of a back gesture. Returns whether an element claimed it
+    /// (`false` without a registered callback).
+    pub fn handle_back_gesture(&self, event: gpui::BackGestureEvent) -> bool {
+        let cb = self.state.lock().back_gesture_callback.take();
+        let Some(mut cb) = cb else {
+            return false;
+        };
+        let claimed = cb(event);
+        let mut state = self.state.lock();
+        if state.back_gesture_callback.is_none() {
+            state.back_gesture_callback = Some(cb);
+        }
+        claimed
+    }
+
     // ── appearance ────────────────────────────────────────────────────────────
 
     /// Update the window's appearance (e.g. after a dark-mode change).
@@ -1178,6 +1199,14 @@ impl AndroidWindow {
         F: FnMut(AndroidKeyEvent) + Send + 'static,
     {
         self.state.lock().key_callback = Some(Box::new(cb));
+    }
+
+    /// Register a callback invoked for each phase of a back gesture.
+    pub fn on_back_gesture<F>(&self, cb: F)
+    where
+        F: FnMut(gpui::BackGestureEvent) -> bool + Send + 'static,
+    {
+        self.state.lock().back_gesture_callback = Some(Box::new(cb));
     }
 
     /// Register a callback invoked when the window is resized.
@@ -1843,6 +1872,14 @@ impl PlatformWindow for AndroidPlatformWindow {
                 let _ = guard(event);
             });
         }
+
+        // ── Back gestures → PlatformInput ───────────────────────────────
+        {
+            let cb = Arc::clone(&input_cb);
+            self.window.on_back_gesture(move |event| {
+                cb.lock()(gpui::PlatformInput::BackGesture(event)).default_prevented
+            });
+        }
     }
 
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>) {
@@ -2338,6 +2375,22 @@ mod tests {
         let events = received.lock();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].key_code, 29);
+    }
+
+    #[test]
+    fn back_gesture_callback_reports_the_claim() {
+        let w = AndroidWindow::headless(1080, 1920, 2.0);
+        let event = gpui::BackGestureEvent::default();
+        assert!(!w.handle_back_gesture(event.clone()));
+
+        let phases = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let p2 = phases.clone();
+        w.on_back_gesture(move |e| {
+            p2.lock().push(e.phase);
+            true
+        });
+        assert!(w.handle_back_gesture(event));
+        assert_eq!(*phases.lock(), [gpui::BackGesturePhase::Started]);
     }
 
     #[test]
