@@ -319,8 +319,7 @@ impl Platform for IosPlatform {
         unsafe {
             let pasteboard: *mut AnyObject = msg_send![class!(UIPasteboard), generalPasteboard];
             if let Some(text) = item.text() {
-                let ns_string: *mut AnyObject =
-                    msg_send![class!(NSString), stringWithUTF8String: text.as_ptr()];
+                let ns_string = super::util::nsstring(&text);
                 let _: () = msg_send![pasteboard, setString: ns_string];
             }
         }
@@ -337,7 +336,9 @@ impl Platform for IosPlatform {
             if utf8.is_null() {
                 return None;
             }
-            let text = std::ffi::CStr::from_ptr(utf8).to_str().ok()?;
+            let length: usize = msg_send![string, lengthOfBytesUsingEncoding: 4_usize];
+            let bytes = std::slice::from_raw_parts(utf8.cast::<u8>(), length);
+            let text = std::str::from_utf8(bytes).ok()?;
             Some(ClipboardItem::new_string(text.to_string()))
         }
     }
