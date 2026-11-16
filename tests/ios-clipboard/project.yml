@@ -1,0 +1,40 @@
+name: ClipboardRegression
+options:
+  bundleIdPrefix: dev.gpui.regression
+  deploymentTarget:
+    iOS: '16.0'
+settings:
+  base:
+    CODE_SIGNING_ALLOWED: NO
+    SWIFT_VERSION: '5.0'
+    ARCHS: arm64
+    ENABLE_DEBUG_DYLIB: NO
+targets:
+  ClipboardRegression:
+    type: application
+    platform: iOS
+    sources: [App.swift]
+    info:
+      path: build/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+    settings:
+      base:
+        OTHER_LDFLAGS: ['$(inherited)', '-Wl,-u,_clipboard_write', '-Wl,-u,_clipboard_check', '"$(REGRESSION_STATIC_LIB)"', '-lc++', '-framework UIKit', '-framework Metal', '-framework MetalKit', '-framework QuartzCore', '-framework CoreText', '-framework CoreGraphics', '-framework Foundation', '-framework Security', '-framework SystemConfiguration']
+  ClipboardTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [Tests.swift]
+    dependencies: [{target: ClipboardRegression}]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  ClipboardRegression:
+    build:
+      targets:
+        ClipboardRegression: all
+    test:
+      targets: [ClipboardTests]
