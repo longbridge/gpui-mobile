@@ -193,11 +193,14 @@ impl Platform for IosPlatform {
 
     fn open_url(&self, url: &str) {
         unsafe {
-            let url_string: *mut AnyObject =
-                msg_send![class!(NSString), stringWithUTF8String: url.as_ptr()];
+            let url_string = super::util::nsstring(url);
             let url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_string];
+            if url.is_null() {
+                return;
+            }
+            let options: *mut AnyObject = msg_send![class!(NSDictionary), dictionary];
             let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
-            let _: () = msg_send![app, openURL: url, options: std::ptr::null::<AnyObject>(), completionHandler: std::ptr::null::<AnyObject>()];
+            let _: () = msg_send![app, openURL: url, options: options, completionHandler: std::ptr::null::<AnyObject>()];
         }
     }
 
