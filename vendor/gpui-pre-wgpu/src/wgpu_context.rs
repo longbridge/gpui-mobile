@@ -1,4 +1,4 @@
-// Modified for gpui-pre (snapshot of zed@d2a4fb6): adapt device queues and sRGB detection to wgpu 30.0.1.
+// Modified for gpui-pre (snapshot of zed@f126950): adapt device queues and sRGB detection to wgpu 30.0.1.
 #[cfg(not(target_family = "wasm"))]
 use crate::{WgpuRenderer, WgpuSurfaceConfig};
 #[cfg(not(target_family = "wasm"))]
@@ -360,6 +360,18 @@ impl WgpuContext {
                 None
             }
         }
+    }
+
+    pub fn supports_transient_attachments(&self) -> bool {
+        #[cfg(target_family = "wasm")]
+        if self.backend == WgpuBackend::BrowserWebGpu {
+            // wgpu passes usage bits straight to the browser without knowing
+            // whether it recognizes this one.
+            return js_sys::Reflect::get(&js_sys::global(), &"GPUTextureUsage".into())
+                .and_then(|usage| js_sys::Reflect::has(&usage, &"TRANSIENT_ATTACHMENT".into()))
+                .unwrap_or(false);
+        }
+        true
     }
 
     #[cfg(target_family = "wasm")]
