@@ -34,6 +34,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     ffi::c_void,
+    ops::Range,
     ptr::{self, NonNull},
     rc::Rc,
     sync::Arc,
@@ -254,62 +255,416 @@ fn register_metal_view_class() -> &'static AnyClass {
     class!(GPUIMetalView)
 }
 
+#[derive(PartialEq)]
+struct NativeTextContext {
+    focus: Option<gpui::FocusId>,
+    origin: usize,
+    text: String,
+    selection: Range<usize>,
+}
+
+impl NativeTextContext {
+    fn matches(&self, handler: &mut PlatformInputHandler) -> bool {
+        if self.focus != handler.focus_id() || !handler.query_accepts_focused_text_input() {
+            return false;
+        }
+        let range = self.origin..self.origin + self.text.encode_utf16().count();
+        if handler
+            .text_input_editable_range()
+            .is_some_and(|allowed| range.start < allowed.start || range.end > allowed.end)
+        {
+            return false;
+        }
+        let mut actual = None;
+        handler
+            .text_for_range(range.clone(), &mut actual)
+            .is_some_and(|text| text == self.text)
+            && actual.is_none_or(|actual| actual == range)
+    }
+
+    fn read(handler: &mut PlatformInputHandler) -> Option<Self> {
+        if !handler.query_accepts_focused_text_input() {
+            return None;
+        }
+        let selection = handler.selected_text_range(false)?.range;
+        let allowed = handler.text_input_editable_range();
+        let length = handler
+            .text_length_utf16()
+            .or_else(|| allowed.as_ref().map(|range| range.end))?;
+        let allowed = allowed.unwrap_or(0..length);
+        if allowed.start > allowed.end
+            || allowed.end > length
+            || selection.start < allowed.start
+            || selection.end > allowed.end
+        {
+            return None;
+        }
+        let requested = selection.start.saturating_sub(2048).max(allowed.start)
+            ..selection.end.saturating_add(512).min(allowed.end);
+        let mut actual = None;
+        let text = handler.text_for_range(requested.clone(), &mut actual)?;
+        let range = actual.unwrap_or(requested);
+        if selection.start < range.start
+            || selection.end > range.end
+            || range.len() != text.encode_utf16().count()
+        {
+            return None;
+        }
+        Some(Self {
+            focus: handler.focus_id(),
+            origin: range.start,
+            text,
+            selection: selection.start - range.start..selection.end - range.start,
+        })
+    }
+}
+
+fn byte_offset(text: &str, offset_utf16: usize) -> Option<usize> {
+    let mut offset = 0;
+    for (byte, character) in text.char_indices() {
+        if offset == offset_utf16 {
+            return Some(byte);
+        }
+        offset += character.len_utf16();
+    }
+    (offset == offset_utf16).then_some(text.len())
+}
+
+fn set_handler_selection(handler: &mut PlatformInputHandler, range: Range<usize>) -> bool {
+    if handler
+        .selected_text_range(false)
+        .map(|selection| selection.range)
+        != Some(range.clone())
+    {
+        handler.set_selected_text_range(range.clone());
+    }
+    // Some handlers retain the default no-op selection setter. Do not send a
+    // selection-dependent key to a different position in those documents.
+    handler
+        .selected_text_range(false)
+        .map(|selection| selection.range)
+        == Some(range)
+}
+
+fn text_change<'a>(
+    before: &str,
+    after: &'a str,
+    range: Range<usize>,
+) -> Option<(Range<usize>, &'a str)> {
+    if let (Some(start), Some(end)) = (
+        byte_offset(before, range.start),
+        byte_offset(before, range.end),
+    ) {
+        let replacement = (start <= end)
+            .then(|| {
+                after
+                    .strip_prefix(&before[..start])
+                    .and_then(|tail| tail.strip_suffix(&before[end..]))
+            })
+            .flatten();
+        if let Some(replacement) = replacement {
+            if before == after && (range.is_empty() || replacement.is_empty()) {
+                return None;
+            }
+            return Some((range, replacement));
+        }
+    }
+    if before == after {
+        return None;
+    }
+
+    // UIKit can revise punctuation outside the original selection.
+    let prefix: usize = before
+        .chars()
+        .zip(after.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum();
+    let suffix: usize = before[prefix..]
+        .chars()
+        .rev()
+        .zip(after[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum();
+    let start = before[..prefix].encode_utf16().count();
+    let removed = before[prefix..before.len() - suffix].encode_utf16().count();
+    Some((start..start + removed, &after[prefix..after.len() - suffix]))
+}
+
 /// UITextView supplies UIKit's complete UITextInput implementation, including
 /// marked text, tokenizer and UTF-16 positions required by Chinese/Japanese IMEs.
-/// Its small private document holds only the current composition; committed text
-/// is forwarded to GPUI and then removed from the native scratch buffer.
+/// Between compositions its document mirrors the GPUI context around the caret,
+/// so keyboards can revise committed text using their native document proxy.
 fn register_text_input_view_class() -> &'static AnyClass {
     TEXT_INPUT_VIEW_CLASS_REGISTERED.call_once(|| {
         let mut decl = ClassBuilder::new(c"GPUITextInputView", class!(UITextView)).unwrap();
         decl.add_ivar::<*mut std::ffi::c_void>(c"gpui_window_ptr");
         decl.add_ivar::<usize>(c"gpui_edit_depth");
         decl.add_ivar::<Bool>(c"gpui_marked_text");
+        decl.add_ivar::<Bool>(c"gpui_context_refresh_pending");
 
         #[allow(deprecated)]
         unsafe fn begin_edit(this: *mut AnyObject) {
             *(*this).get_mut_ivar::<usize>("gpui_edit_depth") += 1;
         }
 
+        // A UIKit edit can request a different selection from the GPUI caret.
+        // Keep the old native range so repeated characters do not shift an edit
+        // to the wrong position when comparing before and after text.
+        enum ContextEdit {
+            Insert {
+                before: String,
+                selection: Range<usize>,
+            },
+            Delete {
+                before: String,
+                selection: Range<usize>,
+            },
+            Replace {
+                before: String,
+                range: Range<usize>,
+            },
+        }
+
+        unsafe fn view_text(this: *mut AnyObject) -> String {
+            let text: *mut AnyObject = msg_send![this, text];
+            let utf8: *const i8 = msg_send![text, UTF8String];
+            if utf8.is_null() {
+                String::new()
+            } else {
+                let length: usize = msg_send![text, lengthOfBytesUsingEncoding: 4_usize];
+                String::from_utf8_lossy(std::slice::from_raw_parts(utf8.cast::<u8>(), length))
+                    .into_owned()
+            }
+        }
+
+        unsafe fn view_selection(this: *mut AnyObject) -> Range<usize> {
+            let selection: super::text_input::ObjcNSRange = msg_send![this, selectedRange];
+            selection.location..selection.location.saturating_add(selection.length)
+        }
+
         #[allow(deprecated)]
-        unsafe fn end_edit(this: *mut AnyObject) {
+        unsafe fn context_window(this: *mut AnyObject) -> Option<&'static IosWindow> {
+            let ptr = *(*this).get_ivar::<*mut c_void>(GPUI_WINDOW_IVAR);
+            (ptr as *const IosWindow).as_ref()
+        }
+
+        unsafe fn ready_context(this: *mut AnyObject) -> Option<&'static IosWindow> {
+            let window = context_window(this)?;
+            window.native_text_context.borrow().as_ref()?;
+            Some(window)
+        }
+
+        unsafe fn write_native_text(this: *mut AnyObject, text: &str, range: Range<usize>) {
+            begin_edit(this);
+            if view_text(this) != text {
+                let text = super::util::nsstring(text);
+                let _: () = msg_send![this, setText: text];
+            }
+            if view_selection(this) != range {
+                let range = super::text_input::ObjcNSRange {
+                    location: range.start,
+                    length: range.len(),
+                };
+                let _: () = msg_send![this, setSelectedRange: range];
+            }
+            #[allow(deprecated)]
+            {
+                *(*this).get_mut_ivar::<usize>("gpui_edit_depth") -= 1;
+            }
+        }
+
+        unsafe fn clear_context(this: *mut AnyObject, window: &IosWindow) {
+            if window.native_text_context.borrow_mut().take().is_some() {
+                write_native_text(this, "", 0..0);
+            }
+        }
+
+        #[allow(deprecated)]
+        unsafe fn sync_context(this: *mut AnyObject, window: &IosWindow, after_edit: bool) {
+            if (*this).get_ivar::<Bool>("gpui_marked_text").as_bool() {
+                return;
+            }
+            let responder: Bool = msg_send![this, isFirstResponder];
+            if !responder.as_bool() || crate::has_text_input_callback() {
+                clear_context(this, window);
+                return;
+            }
+            let Ok(mut handler) = window.input_handler.try_borrow_mut() else {
+                return;
+            };
+            let next = handler.as_mut().and_then(NativeTextContext::read);
+            drop(handler);
+
+            let Some(next) = next else {
+                clear_context(this, window);
+                return;
+            };
+            // UIKit can move its own selection before asking to replace text.
+            // A repaint with identical GPUI state must preserve that selection.
+            let changed = window.native_text_context.borrow().as_ref() != Some(&next);
+            if changed || after_edit {
+                write_native_text(this, &next.text, next.selection.clone());
+                *window.native_text_context.borrow_mut() = Some(next);
+            }
+        }
+
+        #[allow(deprecated)]
+        unsafe extern "C" fn refresh_context(this: *mut AnyObject, _sel: Sel) {
+            *(*this).get_mut_ivar::<Bool>("gpui_context_refresh_pending") = Bool::NO;
+            if *(*this).get_ivar::<usize>("gpui_edit_depth") != 0 {
+                return;
+            }
+            if let Some(window) = context_window(this) {
+                sync_context(this, window, false);
+            }
+        }
+
+        unsafe fn apply_context_edit(
+            this: *mut AnyObject,
+            window: &IosWindow,
+            return_key: bool,
+            native_before: &str,
+            after: &str,
+            range: Range<usize>,
+        ) {
+            let mut handler = window.input_handler.borrow_mut();
+            let context = window.native_text_context.borrow();
+            let edit = context
+                .as_ref()
+                .zip(handler.as_mut())
+                .and_then(|(context, handler)| {
+                    if !context.matches(handler) {
+                        return None;
+                    }
+                    let range = if context.text == native_before {
+                        range
+                    } else {
+                        0..0
+                    };
+                    let change = text_change(&context.text, after, range);
+                    change.map(|(range, replacement)| {
+                        (
+                            context.origin + range.start..context.origin + range.end,
+                            replacement,
+                        )
+                    })
+                });
+            drop(context);
+            if let Some((range, text)) = edit {
+                if return_key && matches!(text, "\n" | "\r" | "\r\n") {
+                    let selected = handler
+                        .as_mut()
+                        .is_some_and(|handler| set_handler_selection(handler, range));
+                    drop(handler);
+                    if selected {
+                        window.handle_text_input(super::util::nsstring(text));
+                    }
+                } else {
+                    if let Some(handler) = handler.as_mut() {
+                        handler.replace_text_in_range(Some(range), text);
+                    }
+                    drop(handler);
+                }
+                sync_context(this, window, true);
+            }
+        }
+
+        // GPUI updates can synchronously trigger UIKit callbacks. Protect both
+        // entry points from trying to borrow the same input handler again.
+        struct ForwardingGuard(*mut AnyObject);
+        impl Drop for ForwardingGuard {
+            #[allow(deprecated)]
+            fn drop(&mut self) {
+                unsafe {
+                    *(*self.0).get_mut_ivar::<usize>("gpui_edit_depth") -= 1;
+                }
+            }
+        }
+
+        unsafe fn forwarding_guard(this: *mut AnyObject) -> ForwardingGuard {
+            begin_edit(this);
+            ForwardingGuard(this)
+        }
+
+        unsafe extern "C" fn become_first_responder(this: *mut AnyObject, _sel: Sel) -> Bool {
+            let active: Bool = msg_send![super(this, class!(UITextView)), becomeFirstResponder];
+            // The Swift host can reopen the keyboard after the last GPUI draw.
+            // Refill the cleared buffer even if no new handler is installed.
+            if active.as_bool() {
+                if let Some(window) = context_window(this) {
+                    window.refresh_native_text_context();
+                }
+            }
+            active
+        }
+
+        // UIKit can perform an edit through its text interaction system without
+        // entering the UIKeyInput overrides (for example, accepting a revision
+        // through the UITextView's existing text services).
+        #[allow(deprecated)]
+        unsafe extern "C" fn native_text_changed(
+            this: *mut AnyObject,
+            _sel: Sel,
+            _notification: *mut AnyObject,
+        ) {
+            if *(*this).get_ivar::<usize>("gpui_edit_depth") != 0 {
+                return;
+            }
+            let Some(window) = ready_context(this) else {
+                return;
+            };
+            let marked: *mut AnyObject = msg_send![this, markedTextRange];
+            let active: Bool = msg_send![this, isFirstResponder];
+            if !active.as_bool()
+                || !marked.is_null()
+                || (*this).get_ivar::<Bool>("gpui_marked_text").as_bool()
+            {
+                return;
+            }
+            let _forwarding = forwarding_guard(this);
+            let after = view_text(this);
+            apply_context_edit(this, window, false, "", &after, 0..0);
+        }
+
+        #[allow(deprecated)]
+        unsafe fn end_edit(this: *mut AnyObject, edit: Option<ContextEdit>) {
             let depth = (*this).get_mut_ivar::<usize>("gpui_edit_depth");
             *depth -= 1;
             if *depth != 0 {
                 return;
             }
 
-            // GPUI updates may synchronously cause UIKit callbacks. Keep those
-            // nested native edits from borrowing the input handler a second time.
-            struct ForwardingGuard(*mut AnyObject);
-            impl Drop for ForwardingGuard {
-                fn drop(&mut self) {
-                    #[allow(deprecated)]
-                    unsafe {
-                        *(*self.0).get_mut_ivar::<usize>("gpui_edit_depth") -= 1;
-                    }
-                }
-            }
-            begin_edit(this);
-            let _forwarding = ForwardingGuard(this);
+            let _forwarding = forwarding_guard(this);
 
             let window_ptr: *mut c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
             if window_ptr.is_null() {
                 return;
             }
             let marked: *mut AnyObject = msg_send![this, markedTextRange];
-            let text: *mut AnyObject = msg_send![this, text];
-            let utf8: *const i8 = msg_send![text, UTF8String];
-            let text_string = if utf8.is_null() {
-                String::new()
-            } else {
-                std::ffi::CStr::from_ptr(utf8)
-                    .to_string_lossy()
-                    .into_owned()
-            };
+            let text_string = view_text(this);
             let was_marked = (*this).get_ivar::<Bool>("gpui_marked_text").as_bool();
             let is_marked = !marked.is_null();
             *(*this).get_mut_ivar::<Bool>("gpui_marked_text") = Bool::new(is_marked);
             let window = &*(window_ptr as *const IosWindow);
+
+            if let Some(edit) = edit.filter(|_| !is_marked && !was_marked) {
+                let (before, range, return_key) = match edit {
+                    ContextEdit::Insert { before, selection } => (before, selection, true),
+                    ContextEdit::Delete { before, selection } => {
+                        let range = if selection.is_empty() {
+                            view_selection(this).start.min(selection.start)..selection.start
+                        } else {
+                            selection
+                        };
+                        (before, range, false)
+                    }
+                    ContextEdit::Replace { before, range } => (before, range, false),
+                };
+                apply_context_edit(this, window, return_key, &before, &text_string, range);
+                return;
+            }
 
             if is_marked {
                 let selected: super::text_input::ObjcNSRange = msg_send![this, selectedRange];
@@ -330,20 +685,20 @@ fn register_text_input_view_class() -> &'static AnyClass {
                 let _: () = msg_send![empty, release];
                 *(*this).get_mut_ivar::<usize>("gpui_edit_depth") -= 1;
 
-                if was_marked {
-                    if let Some(handler) = window.input_handler.borrow_mut().as_mut() {
-                        handler.replace_text_in_range(None, &text_string);
-                        handler.unmark_text();
-                        return;
-                    }
+                let handled = was_marked
+                    && window
+                        .input_handler
+                        .borrow_mut()
+                        .as_mut()
+                        .is_some_and(|handler| {
+                            handler.replace_text_in_range(None, &text_string);
+                            handler.unmark_text();
+                            true
+                        });
+                if !handled {
+                    window.handle_text_input(super::util::nsstring(&text_string));
                 }
-                // Keep NSString alive across clearing the native document.
-                let bytes = text_string.as_bytes();
-                let committed: *mut AnyObject = msg_send![class!(NSString), alloc];
-                let committed: *mut AnyObject = msg_send![committed,
-                    initWithBytes: bytes.as_ptr().cast::<c_void>(), length: bytes.len(), encoding: 4_usize];
-                window.handle_text_input(committed);
-                let _: () = msg_send![committed, release];
+                sync_context(this, window, true);
             }
         }
 
@@ -353,9 +708,13 @@ fn register_text_input_view_class() -> &'static AnyClass {
         }
 
         unsafe extern "C" fn insert_text(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject) {
+            let edit = ready_context(this).map(|_| ContextEdit::Insert {
+                before: view_text(this),
+                selection: view_selection(this),
+            });
             begin_edit(this);
             let _: () = msg_send![super(this, class!(UITextView)), insertText: text];
-            end_edit(this);
+            end_edit(this, edit);
         }
 
         unsafe extern "C" fn set_marked_text(
@@ -364,16 +723,23 @@ fn register_text_input_view_class() -> &'static AnyClass {
             text: *mut AnyObject,
             selected: super::text_input::ObjcNSRange,
         ) {
+            if !prepare_composition(this) {
+                return;
+            }
             begin_edit(this);
             let _: () = msg_send![super(this, class!(UITextView)),
                 setMarkedText: text, selectedRange: selected];
-            end_edit(this);
+            end_edit(this, None);
         }
 
         unsafe extern "C" fn unmark_text(this: *mut AnyObject, _sel: Sel) {
+            let edit = ready_context(this).map(|_| ContextEdit::Replace {
+                before: view_text(this),
+                range: 0..0,
+            });
             begin_edit(this);
             let _: () = msg_send![super(this, class!(UITextView)), unmarkText];
-            end_edit(this);
+            end_edit(this, edit);
         }
 
         // UIKit's attributed composition entry point does not call the plain
@@ -384,16 +750,50 @@ fn register_text_input_view_class() -> &'static AnyClass {
             text: *mut AnyObject,
             selected: super::text_input::ObjcNSRange,
         ) {
+            if !prepare_composition(this) {
+                return;
+            }
             begin_edit(this);
             let _: () = msg_send![super(this, class!(UITextView)),
                 setAttributedMarkedText: text, selectedRange: selected];
-            end_edit(this);
+            end_edit(this, None);
+        }
+
+        unsafe fn prepare_composition(this: *mut AnyObject) -> bool {
+            if let Some(window) = ready_context(this) {
+                let _forwarding = forwarding_guard(this);
+                let selected = {
+                    let context = window.native_text_context.borrow();
+                    let mut handler = window.input_handler.borrow_mut();
+                    context
+                        .as_ref()
+                        .zip(handler.as_mut())
+                        .is_some_and(|(context, handler)| {
+                            let selection = view_selection(this);
+                            context.matches(handler)
+                                && set_handler_selection(
+                                    handler,
+                                    context.origin + selection.start
+                                        ..context.origin + selection.end,
+                                )
+                        })
+                };
+                if !selected {
+                    sync_context(this, window, true);
+                    return false;
+                }
+                clear_context(this, window);
+            }
+            true
         }
 
         #[allow(deprecated)]
         unsafe extern "C" fn reset_composition(this: *mut AnyObject, _sel: Sel) {
             // Focus may already belong to another GPUI input by the time the
             // keyboard is hidden. Never forward this cleanup to that handler.
+            if let Some(window) = context_window(this) {
+                clear_context(this, window);
+            }
             begin_edit(this);
             let _: () = msg_send![super(this, class!(UITextView)), unmarkText];
             let empty: *mut AnyObject = msg_send![class!(NSString), new];
@@ -409,10 +809,22 @@ fn register_text_input_view_class() -> &'static AnyClass {
             range: *mut AnyObject,
             text: *mut AnyObject,
         ) {
+            let edit = ready_context(this).map(|_| {
+                let beginning: *mut AnyObject = msg_send![this, beginningOfDocument];
+                let start: *mut AnyObject = msg_send![range, start];
+                let end: *mut AnyObject = msg_send![range, end];
+                let start: isize =
+                    msg_send![this, offsetFromPosition: beginning, toPosition: start];
+                let end: isize = msg_send![this, offsetFromPosition: beginning, toPosition: end];
+                ContextEdit::Replace {
+                    before: view_text(this),
+                    range: start.max(0) as usize..end.max(0) as usize,
+                }
+            });
             begin_edit(this);
             let _: () =
                 msg_send![super(this, class!(UITextView)), replaceRange: range, withText: text];
-            end_edit(this);
+            end_edit(this, edit);
         }
 
         // Holding the software keyboard's Backspace runs a UIKit timer
@@ -426,6 +838,15 @@ fn register_text_input_view_class() -> &'static AnyClass {
         unsafe extern "C" fn selection_at_document_start(this: *mut AnyObject, _sel: Sel) -> Bool {
             let text: *mut AnyObject = msg_send![this, text];
             let length: usize = msg_send![text, length];
+            if let Some(window) = ready_context(this) {
+                let origin = window
+                    .native_text_context
+                    .borrow()
+                    .as_ref()
+                    .map_or(0, |context| context.origin);
+                let selection = view_selection(this);
+                return Bool::new(origin == 0 && selection == (0..0));
+            }
             let native = length != 0 || (*this).get_ivar::<Bool>("gpui_marked_text").as_bool();
             let window_ptr: *mut c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
             let gpui = if native || window_ptr.is_null() {
@@ -450,17 +871,46 @@ fn register_text_input_view_class() -> &'static AnyClass {
             let text: *mut AnyObject = msg_send![this, text];
             let length: usize = msg_send![text, length];
             let depth = *(*this).get_ivar::<usize>("gpui_edit_depth");
-            if length == 0 && depth == 0 && !(*this).get_ivar::<Bool>("gpui_marked_text").as_bool()
+            let context = ready_context(this);
+            let at_context_start = context.is_some() && view_selection(this) == (0..0);
+            if (length == 0 || at_context_start)
+                && depth == 0
+                && !(*this).get_ivar::<Bool>("gpui_marked_text").as_bool()
             {
                 let window_ptr: *mut c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
                 if !window_ptr.is_null() {
-                    (&*(window_ptr as *const IosWindow)).handle_delete_backward();
+                    let window = &*(window_ptr as *const IosWindow);
+                    let forward = if context.is_some() {
+                        let context = window.native_text_context.borrow();
+                        let mut handler = window.input_handler.borrow_mut();
+                        context
+                            .as_ref()
+                            .zip(handler.as_mut())
+                            .is_some_and(|(context, handler)| {
+                                context.matches(handler)
+                                    && set_handler_selection(
+                                        handler,
+                                        context.origin..context.origin,
+                                    )
+                            })
+                    } else {
+                        true
+                    };
+                    if forward {
+                        let _forwarding = forwarding_guard(this);
+                        window.handle_delete_backward();
+                    }
+                    sync_context(this, window, true);
                 }
                 return;
             }
+            let edit = context.map(|_| ContextEdit::Delete {
+                before: view_text(this),
+                selection: view_selection(this),
+            });
             begin_edit(this);
             let _: () = msg_send![super(this, class!(UITextView)), deleteBackward];
-            end_edit(this);
+            end_edit(this, edit);
         }
 
         unsafe {
@@ -495,6 +945,18 @@ fn register_text_input_view_class() -> &'static AnyClass {
                         *mut AnyObject,
                         super::text_input::ObjcNSRange,
                     ),
+            );
+            decl.add_method(
+                sel!(becomeFirstResponder),
+                become_first_responder as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+            );
+            decl.add_method(
+                sel!(gpuiNativeTextChanged:),
+                native_text_changed as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+            );
+            decl.add_method(
+                sel!(gpuiRefreshTextContext),
+                refresh_context as unsafe extern "C" fn(*mut AnyObject, Sel),
             );
             decl.add_method(
                 sel!(gpuiResetComposition),
@@ -561,6 +1023,7 @@ pub(crate) struct IosWindow {
     scale_factor: Cell<f32>,
     /// Input handler for text input
     input_handler: RefCell<Option<PlatformInputHandler>>,
+    native_text_context: RefCell<Option<NativeTextContext>>,
     /// Callback for frame requests
     /// Note: pub(super) to allow ffi.rs to access this for the display link callback
     pub(super) request_frame_callback: RefCell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
@@ -611,6 +1074,14 @@ impl Drop for IosWindow {
         // freed memory. Pointer matches the one passed to `register_with_ffi`
         // (the window lives at a stable address in a Box for its whole lifetime).
         super::ffi::deregister_window(self as *const Self);
+        // UIKit can still own the view or a deferred text-context refresh.
+        if !self.text_input_view.is_null() {
+            #[allow(deprecated)]
+            unsafe {
+                *(*self.text_input_view).get_mut_ivar::<*mut c_void>(GPUI_WINDOW_IVAR) =
+                    ptr::null_mut();
+            }
+        }
     }
 }
 
@@ -694,6 +1165,10 @@ impl IosWindow {
             let _: () = msg_send![text_input_view, setAlpha: 0.01_f64];
             let _: () = msg_send![text_input_view, setUserInteractionEnabled: true];
             let _: () = msg_send![text_input_view, setScrollEnabled: false];
+            let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+            let name = super::util::nsstring("UITextViewTextDidChangeNotification");
+            let _: () = msg_send![center, addObserver: text_input_view,
+                selector: sel!(gpuiNativeTextChanged:), name: name, object: text_input_view];
             let _: () = msg_send![view, addSubview: text_input_view];
 
             // --- Initialise the wgpu renderer (Metal backend) ---------------
@@ -709,6 +1184,7 @@ impl IosWindow {
                 bounds: Cell::new(screen_bounds),
                 scale_factor: Cell::new(scale_factor),
                 input_handler: RefCell::new(None),
+                native_text_context: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
                 frame_demand: Rc::new(FrameDemand::default()),
                 input_callback: RefCell::new(None),
@@ -1000,6 +1476,29 @@ impl IosWindow {
                 insets.left as f32,
                 insets.right as f32,
             )
+        }
+    }
+
+    #[allow(deprecated)]
+    fn refresh_native_text_context(&self) {
+        if self.text_input_view.is_null() {
+            return;
+        }
+        unsafe {
+            let responder: Bool = msg_send![self.text_input_view, isFirstResponder];
+            if !responder.as_bool() {
+                return;
+            }
+            let pending =
+                (*self.text_input_view).get_mut_ivar::<Bool>("gpui_context_refresh_pending");
+            if pending.as_bool() {
+                return;
+            }
+            *pending = Bool::YES;
+            // A GPUI frame may temporarily own the window and input handler.
+            let _: () = msg_send![self.text_input_view,
+                performSelector: sel!(gpuiRefreshTextContext), withObject: ptr::null::<AnyObject>(),
+                afterDelay: 0.0_f64];
         }
     }
 
@@ -1379,6 +1878,11 @@ impl PlatformWindow for IosWindow {
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         *self.input_handler.borrow_mut() = Some(input_handler);
+        self.refresh_native_text_context();
+    }
+
+    fn text_input_state_changed(&self, _: gpui::TextInputStateChange) {
+        self.refresh_native_text_context();
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {

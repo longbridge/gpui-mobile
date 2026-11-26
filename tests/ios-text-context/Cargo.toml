@@ -1,0 +1,15 @@
+[package]
+name = "gpui-ios-text-context-regression"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+gpui-mobile = { package = "gpui-pre-mobile", path = "../..", default-features = false, features = ["camera", "video_player"] }
+serde_json = "1"
+
+[patch.crates-io]
+gpui-pre-wgpu = { path = "../../vendor/gpui-pre-wgpu" }

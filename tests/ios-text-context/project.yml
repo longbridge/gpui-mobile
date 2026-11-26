@@ -1,0 +1,42 @@
+name: TextContextRegression
+options:
+  bundleIdPrefix: dev.gpui.regression
+  deploymentTarget:
+    iOS: '16.0'
+settings:
+  base:
+    CODE_SIGNING_ALLOWED: NO
+    SWIFT_VERSION: '5.0'
+    ARCHS: arm64
+    ENABLE_DEBUG_DYLIB: NO
+targets:
+  TextContextRegression:
+    type: application
+    platform: iOS
+    sources: [App.swift, Bridge.h]
+    info:
+      path: build/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+    settings:
+      base:
+        SWIFT_OBJC_BRIDGING_HEADER: Bridge.h
+        OTHER_LDFLAGS: ['$(inherited)', '-Wl,-u,_regression_snapshot', '-Wl,-u,_regression_free', '-Wl,-u,_regression_set_document', '-Wl,-u,_regression_frame', '-Wl,-u,_regression_hide_keyboard', '-Wl,-u,_regression_set_editable_range', '"$(REGRESSION_STATIC_LIB)"', '-lc++', '-framework UIKit', '-framework Metal', '-framework MetalKit', '-framework QuartzCore', '-framework CoreText', '-framework CoreGraphics', '-framework Foundation', '-framework Security', '-framework SystemConfiguration']
+  TextContextTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [Tests.swift, Bridge.h]
+    dependencies: [{target: TextContextRegression}]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_OBJC_BRIDGING_HEADER: Bridge.h
+schemes:
+  TextContextRegression:
+    build:
+      targets:
+        TextContextRegression: all
+    test:
+      targets: [TextContextTests]
