@@ -1,16 +1,16 @@
 [package]
 name = "gpui-pre-wgpu"
-version = "0.3.10"
+version = "0.3.14"
 edition = { workspace = true }
 publish = true
 license = "Apache-2.0"
-description = "Zed's `gpui_wgpu` crate (gpui-pre snapshot of zed@08cbb88)"
+description = "Zed's `gpui_wgpu` crate (gpui-pre snapshot of zed@f126950)"
 repository = "https://github.com/zed-industries/zed"
 
 [package.metadata.gpui-pre]
 zed-crate = "gpui_wgpu"
 zed-version = "0.1.0"
-zed-rev = "08cbb88a152c3751a43e853425a70e9f631a5918"
+zed-rev = "f126950f9d3b62666f97437ae5d4ccac2272c4db"
 
 [lib]
 path = "src/gpui_wgpu.rs"
@@ -50,6 +50,7 @@ wgpu = { workspace = true, features = ["std", "metal", "gles", "vulkan", "wgsl",
 wgpu = { workspace = true, default-features = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = { workspace = true }
 web-sys = { workspace = true, features = ["HtmlCanvasElement"] }
 wgpu = { workspace = true, features = ["webgl"] }
 

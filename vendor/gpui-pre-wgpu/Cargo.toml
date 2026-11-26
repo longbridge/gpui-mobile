@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "gpui-pre-wgpu"
-version = "0.3.10"
+version = "0.3.14"
 build = false
 publish = true
 autolib = false
@@ -20,7 +20,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Zed's `gpui_wgpu` crate (gpui-pre snapshot of zed@08cbb88)"
+description = "Zed's `gpui_wgpu` crate (gpui-pre snapshot of zed@f126950)"
 readme = false
 license = "Apache-2.0"
 repository = "https://github.com/zed-industries/zed"
@@ -29,7 +29,7 @@ resolver = "2"
 [package.metadata.gpui-pre]
 zed-crate = "gpui_wgpu"
 zed-version = "0.1.0"
-zed-rev = "08cbb88a152c3751a43e853425a70e9f631a5918"
+zed-rev = "f126950f9d3b62666f97437ae5d4ccac2272c4db"
 
 [features]
 bench-support = [
@@ -61,7 +61,7 @@ version = "1.0.86"
 version = "1"
 
 [dependencies.collections]
-version = "=0.3.10"
+version = "=0.3.14"
 package = "gpui-pre-collections"
 
 [dependencies.cosmic-text]
@@ -77,12 +77,12 @@ default-features = false
 package = "zed-font-kit"
 
 [dependencies.gpui]
-version = "=0.3.10"
+version = "=0.3.14"
 default-features = false
 package = "gpui-pre"
 
 [dependencies.gpui_util]
-version = "=0.3.10"
+version = "=0.3.14"
 package = "gpui-pre-util"
 
 [dependencies.image]
@@ -159,6 +159,9 @@ package = "wgpu"
 version = "30.0.1"
 default-features = true
 package = "wgpu"
+
+[target.'cfg(target_family = "wasm")'.dependencies.js-sys]
+version = "0.3"
 
 [target.'cfg(target_family = "wasm")'.dependencies.web-sys]
 version = "0.3"

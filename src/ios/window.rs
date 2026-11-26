@@ -768,7 +768,7 @@ impl IosWindow {
 
             let surface_result = metal_instance.create_surface_unsafe(target);
             match surface_result {
-                Ok(surface) => match WgpuContext::new(metal_instance, &surface, None) {
+                Ok(surface) => match WgpuContext::new(metal_instance, &surface, &config, None) {
                     Ok(context) => {
                         // Pre-populate gpu_context so WgpuRenderer::new()
                         // reuses our Metal-backed context (and its instance)
